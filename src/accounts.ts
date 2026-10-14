@@ -3,9 +3,17 @@
  *
  * ## 为什么用文件改名，而不是让网关开个接口
  *
- * 网关（upstream HanawaBanana/workbuddy2api，原 Sliverkiss/workbuddy2api 已于 2026-09 删库）只暴露四个路由 —— `POST /v1/chat/completions`、
- * `GET /v1/models`、`GET /status`、`GET /healthz`（`internal/server/handler.go:101-104`），
- * 没有任何账号管理端点，config 里也没有账号级开关（账号优先级完全由池内三因子加权决定）。
+ * 网关（upstream HanawaBanana/workbuddy2api，原 Sliverkiss/workbuddy2api 已于 2026-09 删库）
+ * 本机暴露 **9 条路由**（证据：`_勘察-网关能力.md` §2 全表 + §2.1 鉴权语义）：
+ * `GET /healthz` 免鉴权，另 8 条要 `Authorization: Bearer <api_key>` —— `/status`、
+ * `/v1/models`、`/v1/stats`、`POST /v1/stats/reset`、`POST /v1/chat/completions`，
+ * 以及 `POST /admin/accounts/{uid}/{disable,enable,revive}`。
+ * （交叉验证：二进制里 `withAuth` 闭包恰好 8 个 `func1…func8`，与那 8 条逐一对齐。
+ * 该结论钉在 pin 住的 `UPSTREAM_REF = 1c9aef9ab378217316ee2ddff7eace78381b46c0`（2026-09-20）上，
+ * 换 pin 前请重跑那份勘察。）
+ * 其中**唯一能管账号的**就是那三条 `admin/*` 写端点，它们额外挂在 `admin.enabled` 闸下，
+ * 而本机该闸默认关（实测 404）⇒ 对我们不可用；config 里也没有账号级开关
+ * （账号优先级完全由池内三因子加权决定）。
  * 但它加载账号的 glob 是 `workbuddy*.json`（`internal/auth/auth.go:328`），
  * 因此把文件改名成 `*.json.disabled` 就等于「该账号对网关不存在」。
  * 零 Go 侧改动 → 上游升级零冲突；代价是每次切换要重启网关（见下）。

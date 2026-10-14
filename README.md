@@ -422,7 +422,7 @@ node node_modules/vitest/vitest.mjs run                  # 单元测试
 ```
 
 不想逐条敲上面这些命令（以及下面那条 e2e）时，用一条命令跑完全部闸门 ——
-类型检查、单测、本地 e2e（真文件系统的写路径安全网）、构建：
+类型检查、单测、本地 e2e（真文件系统的写路径安全网）、独立 CLI 的离线契约、构建：
 
 ```bash
 npm run test:suites                # 离线；联网的那条只报 SKIP
@@ -432,6 +432,9 @@ npm run test:suites -- --skip unit  # 只想跑一部分时，被排除的会写
 
 判定规则只有一条：**看子进程退出码**。入口不存在（比如依赖没装）一律记 `SKIP`
 并写明原因 —— "这条检查没跑"和"这条检查过了"不会长得一样。退出码：有 `FAIL` ⇒ 1，否则 0。
+
+独立 CLI（不经 dsh 插件，用来直接查网关，**只读**）：`node tools/wb2api.mjs --help`（或 `npm run cli -- --help`）。
+它的离线契约（`--help` / 未知命令 / `test` 缺 `--model`）已在上面那张套件表里，入口缺失记 `SKIP` 而不是 `PASS`。
 
 集成测试会**真实发起对话**（消耗账号额度），需显式开启：
 
@@ -459,6 +462,8 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 | `src/gateway-binary.ts` | 预编译二进制的下载、SHA256 校验、运行目录（`config.json`）准备 |
 | `src/login.ts` | 用 Node 复刻上游 OAuth 登录（取授权链接 → 轮询 token → 落盘凭证） |
 | `src/setup.ts` | `/wb2api-setup` 的编排与逐步骤汇报 |
+| `src/nickname.ts` | 昵称脱敏：`/status.nickname` 在本 build 实测就是手机号，只在**看起来像手机号**时打码成 `186****5617`，其余原样（一律打码会让账号列表失去可辨识性）；`index.ts` 与 `setup.ts` 共用这一份 |
+| `src/boot-trace.ts` | 插件自己的启动轨迹：`<dsh home>/.wb2api/boot.log` 追加写一行一个锚点（`apply` / `settings` / 凭据 / 目录 / 服务 / 墓碑 / `seed`），失败全吞 —— 宿主日志看不见时才靠它区分「没加载」与「加载了但某步没跑」 |
 | `src/zip.ts` | 极简 ZIP 读取（stored/deflate），避免引入解压依赖 |
 | `src/sse.ts` | SSE 空闲超时读取、工具参数归一化、孤儿工具配对清理 |
 | `tests/unit/turn-key-contract.spec.ts` | 轮级聚合键的跨语言契约 |
@@ -487,6 +492,7 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 - **生成的配置只监听 `127.0.0.1` 且必带随机 `api_key`** —— 上游示例的 `:7863` 会绑 `0.0.0.0`（实测 `netstat` 可见），而网关在 `api_key` 为空时**完全不鉴权**，`/status` 会暴露账号与积分。
 - **装二进制前必须校验 SHA256，且拿不到校验和就拒绝安装** —— 下载的是**会被执行的文件**。校验和清单缺失时"下都下了就装"等于没有校验。
 - **`auths/` 目录必须先于网关启动而存在** —— 网关只在启动时探测该目录，不可读就永久跳过 `auths` 热加载（实测日志：`[watch] auths 目录 ./auths 不可读，跳过热加载监听（加账号后需手动重启）`），之后新增账号不会再被自动加载。
+- **启动轨迹写不进去也必须当没写** —— 插件自己往 `<dsh home>/.wb2api/boot.log` 追加一行行锚点（`apply: …` / `settings: acquired` / `credential: …` / `seed: …`），因为 `ctx.logger` 的输出在这套运行形态里进不了 host 日志，而顶部那条 `console.log('[workbuddy2api] module loaded')` 只回答「插件跑没跑」——这个文件才回答「跑到哪一步、结果是什么」。它**每一处都包在 `try/catch` 里全吞**（`src/boot-trace.ts`），跟 `state.json` 同一目录但**追加写、不清空不轮转**：一次追踪写失败若能把启动搞挂，那它就比它诊断的那个问题更糟；而清空会让「上一次启动发生了什么」正好在最需要它的时候消失。（`--rebuild` 的墓碑读写结果也在轨迹里 —— 「没有记录」渲染成 `none`，与「记录是空的」`0` 分得开。）
 
 ---
 

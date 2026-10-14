@@ -1,7 +1,7 @@
 /**
  * 一条命令跑完全部闸门（A2）。
  *
- *   <node> tools/_run-suites.mjs                 离线：类型检查 / 单测 / 本地 e2e / 构建
+ *   <node> tools/_run-suites.mjs                 离线：类型检查 / 单测 / 本地 e2e / CLI 契约 / 构建
  *   <node> tools/_run-suites.mjs --network       追加「真实网关」集成（联网，真实对话会花额度）
  *   <node> tools/_run-suites.mjs --skip unit     跳过标签含 "unit" 的套件（可重复，也支持 --skip=unit）
  *   <node> tools/_run-suites.mjs --help          打印这张表就退出
@@ -19,6 +19,10 @@
  * `describe.skipIf(!ENABLED)` 自己跳过，而 vitest 对"自己跳过的用例"退出码仍是 0 ——
  * 直接跑会把一个**一个字都没执行**的套件报成 PASS。所以这里先看它自己的开关，
  * 没开就记 SKIP 并把开法写进原因里。
+ *
+ * `tools/wb2api.mjs` 是**独立于插件的第二入口**，它不在 `tests/unit/**` 的 include 里，
+ * 所以单独一条 `cli 离线契约`。这条同样按 `{ skip }` 进表：CLI 或它的 spec 缺任一个
+ * 都留一行显式 SKIP，而不是从表里消失（理由见上面规矩①）。
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
@@ -41,6 +45,8 @@ const TSC = 'node_modules/typescript/bin/tsc'
 const VITEST = 'node_modules/vitest/vitest.mjs'
 const E2E_CONFIG = 'vitest.e2e.config.ts'
 const SPEC_LOCAL = 'tests/e2e/write-guard-fs.spec.ts' // 纯本地文件系统，默认跑
+const CLI_TOOL = 'tools/wb2api.mjs' // 独立 CLI（不经 dsh 插件）
+const SPEC_CLI = 'tests/e2e/cli-offline.spec.ts' // 上面那个 CLI 的离线契约
 const SPEC_LIVE = 'tests/e2e/live-gateway.spec.ts' // 打真网关 + 真实对话，默认不跑
 const DEFAULT_TIMEOUT_MS = 180_000
 const NETWORK_TIMEOUT_MS = 600_000 // live spec 自己的 testTimeout 是 300s，别在这里先把它掐死
@@ -50,6 +56,19 @@ const LIVE_ENABLED =
 const LIVE_HINT =
   '未开启：需要 DSH_WB2API_E2E=1 与 DSH_WB2API_E2E_CONFIRM=yes（否则 spec 自己 skip，退出码 0 会伪装成 PASS）'
 
+/**
+ * 独立 CLI 那条套件的 SKIP 原因（`undefined` = 该跑）。
+ *
+ * 它有两个入口（CLI 本体 + 契约 spec），**缺任一个都记 SKIP、留在表里** —— 见文件头规矩①。
+ * 这里刻意不用 `SPEC_LOCAL` 那种"整行条件展开"的写法：行没了，汇总里就只剩一个
+ * 说不清是"已通过"还是"根本没这条"的空白，而 CLI 被删/改名恰恰是最容易悄悄发生的事。
+ * 显式 SKIP 会连原因一起打印出来。
+ */
+const CLI_SKIP =
+  !existsSync(join(ROOT, CLI_TOOL)) ? `${CLI_TOOL} 不存在（独立 CLI 未提供？）`
+    : !existsSync(join(ROOT, SPEC_CLI)) ? `${SPEC_CLI} 不存在`
+      : undefined
+
 /** [标签, 入口(相对 ROOT), 参数, { skip?, timeoutMs? }?] */
 const SUITES = [
   ['typecheck (tsc --noEmit)', TSC, ['-p', 'tsconfig.json', '--noEmit']],
@@ -58,6 +77,14 @@ const SUITES = [
   ...(existsSync(join(ROOT, SPEC_LOCAL))
     ? [['e2e 写路径安全网 (真实文件系统, 离线)', VITEST, ['run', '--config', E2E_CONFIG, SPEC_LOCAL]]]
     : []),
+  // 独立 CLI 的离线契约：--help / 未知命令 / test 缺 --model —— 三条都只读参数、不发请求。
+  // `test` 是那个 CLI 里唯一会花额度的命令，所以"缺参数在拨号前就被拦住"值得钉住。
+  [
+    'cli 离线契约 (tools/wb2api.mjs 参数与退出码)',
+    VITEST,
+    ['run', '--config', E2E_CONFIG, SPEC_CLI],
+    { skip: CLI_SKIP },
+  ],
   ['build (tsc -p tsconfig.json → lib/)', TSC, ['-p', 'tsconfig.json']],
   // 联网组：只有 --network 才进表（不进表 = 这条本就不在本次范围内，表尾会说明）
   ...(NETWORK

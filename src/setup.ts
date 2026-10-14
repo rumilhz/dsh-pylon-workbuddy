@@ -40,6 +40,7 @@ import type { AuthAccount } from './accounts.js'
 import type { GatewayStatus } from './gateway-supervisor.js'
 import type { GatewayBinaryInstaller, InstallResult } from './gateway-binary.js'
 import type { Realm } from './login.js'
+import { maskNickname } from './nickname.js'
 
 /** 步骤状态。 */
 export type StepStatus = 'ok' | 'skipped' | 'failed'
@@ -254,7 +255,7 @@ export class SetupRunner {
     const existing = this.options.accountStore.list().filter(item => item.enabled)
     if (existing.length > 0) {
       const names = existing
-        .map(item => `${item.nickname !== '' ? item.nickname : '(无昵称)'}·${item.realm}`)
+        .map(item => `${item.nickname !== '' ? maskNickname(item.nickname) : '(无昵称)'}·${item.realm}`)
         .join('、')
       steps.push({
         title: '检查账号',
@@ -286,7 +287,7 @@ export class SetupRunner {
     steps.push({
       title: '登录账号',
       status: 'ok',
-      detail: `${account.nickname !== '' ? account.nickname : '(无昵称)'} · ${account.realm}`
+      detail: `${account.nickname !== '' ? maskNickname(account.nickname) : '(无昵称)'} · ${account.realm}`
         + `（当前启用 ${enabled.length} 个账号）`,
     })
     return true

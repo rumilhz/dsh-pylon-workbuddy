@@ -38,6 +38,8 @@ import {
   type WriteGuard,
 } from './provider-config.js'
 import { openTombstone } from './plugin-state.js'
+import { trace } from './boot-trace.js'
+import { maskNickname } from './nickname.js'
 import {
   defaultBackupDir,
   judgeWrite,
@@ -103,6 +105,15 @@ export type { AuthFileDocument, LoginResult, Realm } from './login.js'
 export { renderSetupReport, SetupRunner } from './setup.js'
 export type { SetupOutcome, SetupStep, StepStatus } from './setup.js'
 export { extractFile, listEntries, ZipError } from './zip.js'
+export {
+  BOOT_LOG_FILE_NAME,
+  bootLogPath,
+  resolveBootLogPath,
+  trace,
+  writeBootTrace,
+} from './boot-trace.js'
+export type { BootTraceOptions } from './boot-trace.js'
+export { maskNickname } from './nickname.js'
 
 /**
  * 模块级「我加载了」信号。
@@ -117,6 +128,12 @@ export { extractFile, listEntries, ZipError } from './zip.js'
  *   · 模块**没被 import**     → 这一行不出现；
  *   · import 了但 `apply` 没跑 → 这一行出现、而 apply 那行不出现
  *     （cordis 在 inject 服务缺失时会让插件停在 PENDING，**不报错**）。
+ *
+ * ★ **这是「主机可见日志」通道，与 `boot-trace.ts` 的轨迹是两回事、两者都留**：
+ * 本通道回答「插件跑没跑」（宿主的日志文件里看得见）；`trace('…')` 落在
+ * `<DSH_HOME>/.wb2api/boot.log`，回答「跑到哪一步、那一步的结果是什么」——
+ * 后者在 `ctx.logger` 输出不可见时是唯一能读出「settings 拿到没有 / 凭据解析出什么 /
+ * 墓碑读到了几条」的地方。**不要用其中一个替换另一个。**
  */
 console.log('[workbuddy2api] module loaded')
 
@@ -227,6 +244,41 @@ function createWriteGuard(ctx: Context, config: GatewayPluginConfig): WriteGuard
 }
 
 /**
+ * 本轮 `ensureEditableProvider` 里墓碑的实际读写结果（只给 {@link trace} 用）。
+ *
+ * 存在的理由是**措辞不能丢信息**：读返回 `undefined` 与返回 `[]` 是两件完全不同的事
+ * （「不知道」vs「知道，一个都没提供过」，见 `plugin-state.ts`），而这两者恰恰决定了
+ * `--rebuild` 是「什么都不加」还是「补新增」。轨迹里必须把这条区分写清楚 ——
+ * 所以没有记录时渲染成 `none`，而不是渲染成 `0`。
+ *
+ * 模块级而不是闭包级：读发生在 `seedEditableProvider` 内部（我们只在接线处拿到回调），
+ * 写发生在它返回之后，中间隔着一次 await —— 闭包在这里反而绕。
+ */
+const lastTombstone: { read?: string[] | undefined; wrote?: number | undefined } = {}
+
+/**
+ * 把墓碑的读写结果渲染成**一行**轨迹。
+ *
+ * @param outcome - 本轮的 seed 结果（取 `offeredModels` 与 `stateWarning`）。
+ * @returns 形如 `rebuilt ns=llm-pi-ai added=2 kept=10 tombstoneRead=none tombstoneWrote=12` 的一行；
+ *   `stateWarning` 非空时在末尾补一句说明（墓碑没写进去**不影响** provider 自身的写入结果）。
+ */
+function renderTombstoneTrace(outcome: SeedOutcome): string {
+  const parts: string[] = [`kind=${outcome.kind}`]
+  if (outcome.kind === 'rebuilt') {
+    parts.push(`added=${outcome.addedModels.length}`, `kept=${outcome.keptModels}`)
+    if (outcome.holdReason !== undefined) parts.push(`held=${outcome.holdReason}`)
+  }
+  if ('offeredModels' in outcome) parts.push(`offered=${outcome.offeredModels.length}`)
+  // `undefined` ⇒ 「没有记录」（不是「记录是空的」）；`[]` ⇒ 「知道，一个都没提供过」。
+  parts.push(`tombstoneRead=${lastTombstone.read === undefined ? 'none' : lastTombstone.read.length}`)
+  if (lastTombstone.wrote !== undefined) parts.push(`tombstoneWrote=${lastTombstone.wrote}`)
+  const warning = 'stateWarning' in outcome ? outcome.stateWarning : undefined
+  if (warning !== undefined) parts.push(`stateWarning=${warning}`)
+  return `tombstone: ${parts.join(' ')}`
+}
+
+/**
  * 把「只增不删」的记忆载体 —— **墓碑集合** —— 接到 provider 写入路径上。
  *
  * 落点是 `<DSH_HOME>/.wb2api/state.json`（**有点**；网关自己的工作目录是
@@ -247,12 +299,26 @@ function createTombstoneWiring(
 ): Pick<SeedDeps, 'readOffered' | 'writeOffered'> {
   const profile = ctx.get('profileContext') as ProfileContextLike | undefined
   const tombstone = openTombstone({ providerName: config.providerName, profileHome: profile?.home })
-  if (tombstone === undefined) return {}
+  if (tombstone === undefined) {
+    // 「拿不到 home」本身就是要紧的排障事实：它让 `--rebuild` 退化成保守的「什么都不加」，
+    // 而用户那边的观感是「明明网关加了模型，怎么没补上」。不写这一行就只能靠猜。
+    trace('tombstone: DISABLED — 推导不出 home（profileContext.home / DSH_HOME / ~/.dsh 全落空）')
+    return {}
+  }
   return {
-    readOffered: async () => tombstone.read(),
+    readOffered: async () => {
+      const ids = tombstone.read()
+      lastTombstone.read = ids
+      trace(`tombstone: read=${ids === undefined ? 'none（没有记录）' : `${ids.length} 个 id`} ← ${tombstone.filePath}`)
+      return ids
+    },
     // 抛错由 seedEditableProvider 捕获并记进结果的 stateWarning —— 墓碑写不进去
     // 绝不能把一次**已经成功**的 provider 写入报告成失败。
-    writeOffered: async (ids: string[]) => { tombstone.write(ids) },
+    writeOffered: async (ids: string[]) => {
+      tombstone.write(ids)
+      lastTombstone.wrote = ids.length
+      trace(`tombstone: wrote=${ids.length} 个 id → ${tombstone.filePath}`)
+    },
   }
 }
 
@@ -276,9 +342,20 @@ async function ensureEditableProvider(
   resolveApiKey: () => Promise<string | undefined>,
   overwrite = false,
 ): Promise<SeedOutcome> {
+  // 本轮开始：清掉上一轮的墓碑读数，免得上一次的结果（或「一次都没读」）被这一次
+  // 渲染成好像是这次读到的。轨迹可以少一行，但不能有一行是**错的**。
+  lastTombstone.read = undefined
+  lastTombstone.wrote = undefined
+  trace(`seed: start（overwrite=${String(overwrite)} —— ${overwrite ? '--rebuild：存在也会去对目录，只增不删' : '仅缺失时创建，存在即不碰'}）`)
   await waitForLoaderSettled(ctx)
-  return await seedEditableProvider({
-    settings: ctx.get('settings') as SettingsServiceLike | undefined,
+  // settings 是「能不能自动写 provider」的开关：它缺失时整步降级成「打印手工块」。
+  // 这一行把那次降级从「provider 没出现」这种结果，变回「settings 没拿到」这个原因。
+  const settings = ctx.get('settings') as SettingsServiceLike | undefined
+  trace(settings === undefined
+    ? 'settings: MISSING（没有 settings 服务 —— 无法自动写 provider，将降级为打印手工块）'
+    : 'settings: acquired')
+  const outcome = await seedEditableProvider({
+    settings,
     providerName: config.providerName,
     preferredNamespace: config.providerNamespace,
     apiKeyEnv: config.apiKeyRef,
@@ -286,12 +363,29 @@ async function ensureEditableProvider(
     overwrite,
     guard: createWriteGuard(ctx, config),
     ...createTombstoneWiring(ctx, config),
-    fetchEntries: async () => readCatalogEntries(await fetchModelList({
-      baseURL: config.baseURL,
-      apiKey: await resolveApiKey(),
-      timeoutMs: config.healthTimeoutSeconds * 1000,
-    })),
+    fetchEntries: async () => {
+      // 「目录」这一锚点只在**真的需要拉目录**时出现（provider 已存在且不是 --rebuild
+      // 时根本不会走到这里）。它的存在与否本身就是一条信息：
+      // 出现 = 这一轮确实去问了网关有什么模型。
+      try {
+        const entries = readCatalogEntries(await fetchModelList({
+          baseURL: config.baseURL,
+          apiKey: await resolveApiKey(),
+          timeoutMs: config.healthTimeoutSeconds * 1000,
+        }))
+        trace(`directory: ${entries.length} 个模型（来自 ${config.baseURL}）`)
+        return entries
+      } catch (error) {
+        trace(`directory: FAILED — ${error instanceof Error ? error.message : String(error)}`)
+        throw error
+      }
+    },
   })
+  // 墓碑读写是 `--rebuild` 的全部判据（「只增不删」靠它），结果必须落进轨迹：
+  // 出问题时第一个要回答的就是「它到底读到了什么、写回去了没有」。
+  trace(renderTombstoneTrace(outcome))
+  trace(`seed: ${outcome.kind}${'ns' in outcome ? ` ns=${outcome.ns}` : ''}`)
+  return outcome
 }
 
 /** 手工粘贴块的抬头（说清贴到哪一层，粘错层级不会报错、只会被静默忽略）。 */
@@ -430,6 +524,11 @@ async function makeApiKeyResolver(ctx: Context, config: GatewayPluginConfig): Pr
   } catch {
     toRef = undefined
   }
+  // 动态 import 成没成，决定了「凭据库」那一层还在不在链上。失败是**静默降级**
+  // （后面还有环境变量与 config.json 兜底），所以只有轨迹能说明它到底试没试过。
+  trace(toRef === undefined
+    ? 'credential: @deepseek-ai/dsh-credentials 不可用（动态 import 失败）—— 解析链降级为 env → 网关 config.json'
+    : 'credential: 解析链就绪（凭据库 → env → 网关 config.json）')
 
   return async () => {
     if (ref.length > 0 && toRef !== undefined) {
@@ -440,21 +539,30 @@ async function makeApiKeyResolver(ctx: Context, config: GatewayPluginConfig): Pr
         try {
           const resolved = await credentials.resolve(toRef(ref))
           if (resolved !== undefined && typeof resolved.value === 'string' && resolved.value.length > 0) {
+            trace(`credential: 取自凭据库（ref=${ref}）`)
             return resolved.value
           }
         } catch (error) {
           ctx.logger.warn(
             `[workbuddy2api] 读取凭据 ${ref} 失败：${error instanceof Error ? error.message : String(error)}`,
           )
+          trace(`credential: 凭据库读取抛错（ref=${ref}）—— ${error instanceof Error ? error.message : String(error)}`)
         }
       }
     }
     if (ref.length > 0) {
       const fromEnv = process.env[ref]
-      if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv
+      if (fromEnv !== undefined && fromEnv.length > 0) {
+        trace(`credential: 取自环境变量 ${ref}`)
+        return fromEnv
+      }
     }
     // 最后回退：直接读网关自身的 config.json（同机部署时无需重复配置凭据）。
-    return readApiKeyFromGatewayConfig(config)
+    const fallback = readApiKeyFromGatewayConfig(config)
+    trace(fallback === undefined
+      ? 'credential: 拿不到（凭据库 / env / 网关 config.json 全落空）—— 网关若要求鉴权，请求会被拒'
+      : 'credential: 取自网关 config.json')
+    return fallback
   }
 }
 
@@ -645,6 +753,13 @@ function shortUid(uid: string): string {
   return uid.length > 7 ? `…${uid.slice(-6)}` : uid
 }
 
+/**
+ * 昵称脱敏（实现在 `nickname.ts` —— `setup.ts` 也要用，放这里会形成循环 import）。
+ *
+ * `/status.nickname` 在本 build 实测就是手机号，而它出现在账号列表 / 选择弹窗 / 登录回执里。
+ * 规则：像手机号才打码，其余原样（一律打码会让账号列表失去可辨识性）。
+ */
+
 /** 秒数渲染成「N 分 M 秒」。 */
 function formatRemaining(seconds: unknown): string {
   if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return '0 秒'
@@ -656,7 +771,7 @@ function formatRemaining(seconds: unknown): string {
 
 /** 单个账号的一行描述（本地文件信息 + 网关实时字段）。 */
 function describeAccount(account: AuthAccount, live: GatewayAccountStatus | undefined): string {
-  const head = `${account.nickname !== '' ? account.nickname : '(无昵称)'} · ${shortUid(account.uid)} · ${account.realm}`
+  const head = `${account.nickname !== '' ? maskNickname(account.nickname) : '(无昵称)'} · ${shortUid(account.uid)} · ${account.realm}`
   if (!account.enabled) return `${head} · 已禁用（网关未加载，积分未知）`
   if (live === undefined) return `${head} · 网关未上报（刚启动或不在池中）`
   const bits: string[] = []
@@ -671,7 +786,7 @@ function describeAccount(account: AuthAccount, live: GatewayAccountStatus | unde
 /** 人话描述当前选择（命令回执与状态命令共用，避免两处文案漂移）。 */
 function describeSelection(accounts: AuthAccount[], enabled: AuthAccount[]): string {
   if (enabled.length === accounts.length || enabled.length === 0) return '自动（全部账号参与轮换）'
-  return `仅 ${enabled.map(a => `${a.nickname !== '' ? a.nickname : shortUid(a.uid)}(${shortUid(a.uid)})`).join('、')}`
+  return `仅 ${enabled.map(a => `${a.nickname !== '' ? maskNickname(a.nickname) : shortUid(a.uid)}(${shortUid(a.uid)})`).join('、')}`
 }
 
 /**
@@ -729,18 +844,37 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   // （`dsh-settings` 没有 `register`），调用只会被 catch 成一条噪音 warn；
   // 删除理由与替代路径见上方 `inject` 后的长注释与 `provider-config.ts`。
 
+  // ★ 轨迹的**第一行**：它落盘即证明 `apply` 跑了。与上面那条 `console.log` 是同一次
+  // 启动里的两个通道 —— 那条给宿主日志，这条给插件自己的目录（后者能活过日志被截断）。
+  trace(
+    `apply: provider=${config.providerName}`
+    + ` namespace=${config.providerNamespace.length > 0 ? config.providerNamespace : '(自动探测)'}`
+    + ` registerOwnProvider=${String(config.registerOwnProvider)}`
+    + ` autoStart=${String(config.autoStart)}`
+    + ` baseURL=${config.baseURL}`,
+  )
+
   const subprocess = ctx.get('subprocess') as SubprocessRuntime | undefined
   if (subprocess === undefined) {
     ctx.logger.error('[workbuddy2api] subprocess 服务不可用，网关进程无法托管；provider 仍会注册。')
+    trace('service: subprocess MISSING —— 网关进程无法托管（命令与 provider 仍可用）')
+  } else {
+    trace('service: subprocess acquired')
   }
 
   const supervisor = subprocess !== undefined
     ? new GatewaySupervisor({ config, subprocess, logger: ctx.logger })
     : undefined
+  trace(supervisor === undefined
+    ? 'service: supervisor 未构造（subprocess 缺失）'
+    : `service: supervisor 就绪（端点 ${config.baseURL}）`)
 
   // 账号开关（auths/ 凭证文件重命名）。只做文件读写，因此 subprocess 缺失时照样可构造
   // ——那种环境下命令会明确报「无法托管网关进程」而不是静默什么都不做。
   const accountStore = new AccountStore({ config, logger: ctx.logger })
+  // 目录这一锚点有**两处**：这里是 auths/（本地凭证），fetchEntries 里那个是网关模型目录。
+  // 分开打是因为它们坏的成因完全不同（本机文件 vs 网关/网络）。
+  trace(`directory: auths=${accountStore.authDir()}`)
 
   // 预编译二进制的获取（`/wb2api-setup` 在缺货时调用；见 gateway-binary.ts）。
   // installDir 与 runtimeDir 分工：`bin/` 放可执行文件，根目录放 config.json 与 auths/。
@@ -750,12 +884,16 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     listenPort: config.listenPort,
     logger: ctx.logger,
   })
+  trace(`service: binary installer 就绪（repo=${config.binaryReleaseRepo}）`)
 
   // 登录客户端（`/wb2api-login` 与 `/wb2api-setup` 共用同一条流程）。
   const loginClient = new LoginClient()
 
   // 界面化选择经由 dsh 的 user-questions 服务；缺失时命令降级为文本列表 + 参数用法。
   const userQuestions = ctx.get('userQuestions') as UserQuestionsService | undefined
+  trace(userQuestions?.ask === undefined
+    ? 'service: userQuestions MISSING —— 弹窗选择降级为文本列表 + 参数用法'
+    : 'service: userQuestions acquired')
 
   // 凭据解析在异步初始化完成后填充；catalog 与 adapter 都通过闭包读取它。
   let apiKeyResolver: () => Promise<string | undefined> = async () => undefined
@@ -823,6 +961,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   let routeOwnedByOther = false
 
   if (config.registerOwnProvider) {
+    trace(`route: registerOwnProvider=true —— 尝试注册自带路由 "${PROVIDER}"（旧行为）`)
     try {
       // 让模型设置页知道这条路由存在（即使尚未激活）。
       ctx.llm.registerConfigurableProviders([
@@ -854,6 +993,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
         + 'provider id 相同，agent-default-model / subagent-model-selection 的引用无需改动。'
         + '在删除之前，模型请求仍走那份手工配置。',
       )
+      trace(`route: 自带路由 "${PROVIDER}" 被外部配置占用（DUPLICATE_ADAPTER 一类）—— 模型请求走手工配置`)
     }
     ctx.logger.info(
       `[workbuddy2api] registerOwnProvider=true：已按旧行为注册自带路由 "${PROVIDER}"；`
@@ -861,6 +1001,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
       + '要让它在「设置 → 模型」里可编辑，请把 registerOwnProvider 置回 false。',
     )
   } else {
+    trace(`route: 自带路由 "${PROVIDER}" 未注册（默认）—— 模型目录由可编辑 provider "${config.providerName}" 承载`)
     ctx.logger.info(
       `[workbuddy2api] 自带路由 "${PROVIDER}" 未注册（registerOwnProvider=false，默认）。`
       + `模型目录将由可编辑 provider "${config.providerName}" 承载。`,
@@ -921,6 +1062,11 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
         const wantsRebuild = /(^|\s)--rebuild(\s|$)/.test(rawInput)
         if ((wantsCreate || wantsRebuild) && !config.registerOwnProvider) {
           // `--rebuild` 与 `--create` 的唯一区别是**已存在时也去对一遍目录**。
+          // 这一行要在调 `ensureEditableProvider` **之前**打：那一步会写盘，
+          // 万一它卡住或抛错，「用户敲的到底是 --rebuild 还是 --create」必须已经落盘。
+          trace(wantsRebuild
+            ? 'command: /wb2api-provider --rebuild（只增不删，读墓碑）'
+            : 'command: /wb2api-provider --create（仅缺失时创建）')
           const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver(), wantsRebuild)
           const header = wantsRebuild
             ? '（显式 --rebuild：**只增不删** —— 只补网关新增的模型，你在模型页删掉的不会复活。'
@@ -1116,7 +1262,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
         return {
           ok: true,
           text: [
-            `登录成功：${result.account.nickname !== '' ? result.account.nickname : '(无昵称)'} · ${result.realm}`,
+            `登录成功：${result.account.nickname !== '' ? maskNickname(result.account.nickname) : '(无昵称)'} · ${result.realm}`,
             `凭证文件：${file}`,
             `${checkin !== undefined ? `签到：${checkin}` : ''}`,
             `网关：${restartLine}`,
@@ -1286,7 +1432,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     const autoLabel = '自动 · 全部账号参与轮换'
     const labels = new Map<string, AccountSelection>([[autoLabel, { kind: 'auto' }]])
     const accountOptions = menu.accounts.map((account) => {
-      const base = `${account.nickname !== '' ? account.nickname : '(无昵称)'} · ${shortUid(account.uid)}`
+      const base = `${account.nickname !== '' ? maskNickname(account.nickname) : '(无昵称)'} · ${shortUid(account.uid)}`
       // label 是答案回传的唯一键：同昵称（甚至同短 uid）撞车时必须补足区分度，
       // 否则点 A 会切到 B。
       const label = labels.has(base) ? `${base} · ${account.realm}` : base
@@ -1447,12 +1593,15 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
         const status = await supervisor.start()
         if (status.state === 'failed') {
           ctx.logger.error(`[workbuddy2api] 自动启动失败：${status.lastError ?? '未知原因'}`)
+          trace(`gateway: 自动启动 FAILED — ${status.lastError ?? '未知原因'}`)
           return
         }
         // 网关就绪后再报一次：启动是异步的，先前的注册日志只能说明「打算拉起」，
         // 此时才有账号可用性可讲。没有这一条，用户只能看到「已注册」而不知道
         // 网关到底起没起来、有没有账号（账号为 0 时更是只能靠模型请求失败去猜）。
         ctx.logger.info(renderReadySummary(status))
+        trace(`gateway: ${status.state} · ${status.baseURL}`
+          + `${status.health !== undefined ? ` · 账号 ${status.health.healthy}/${status.health.total} 可用` : ' · 未探到 /healthz'}`)
         if (status.health !== undefined && status.health.healthy === 0) {
           ctx.logger.warn(
             '[workbuddy2api] 网关已就绪，但没有可用账号 —— 执行 /wb2api-setup 完成登录后即可对话。',
@@ -1463,10 +1612,17 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           `[workbuddy2api] 自动启动失败：${error instanceof Error ? error.message : String(error)}。`
           + '可用 /wb2api-setup 或 /wb2api-start 手工重试。',
         )
+        trace(`gateway: 自动启动 threw — ${error instanceof Error ? error.message : String(error)}`)
       })
     }, 0)
     timer.unref?.()
     ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: autostart timer')
+  } else {
+    // 「网关那一锚点没出现」有两种完全不同的成因：autoStart 关了、或者 subprocess 缺失。
+    // 不写这一行，两者在轨迹里长得一模一样。
+    trace(config.autoStart
+      ? 'gateway: 未自动启动（subprocess 服务缺失）'
+      : 'gateway: 未自动启动（autoStart=false）')
   }
 
   // ⑤ 可编辑 provider：与自动启动**并行**的独立一步。
@@ -1478,6 +1634,10 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   // 只在默认路径下做：回退路径（registerOwnProvider=true）注册的是插件自带路由，
   // 同一个名字再写一份 pi-ai 配置会撞 DUPLICATE_ADAPTER。
   if (!config.registerOwnProvider) {
+    // 打这一行是**为了区分「没排上队」与「排上了但没跑完」**：这步挂在 `setTimeout(0)`
+    // 上、又被 `timer.unref()` 放手，进程提前退出时它可能一次都没跑。轨迹里若只有
+    // 这一行、没有后面的 `seed: start`，成因就唯一确定了。
+    trace('seed: 已排入 setTimeout(0)（与自动启动并行）')
     const timer = setTimeout(() => {
       void ensureEditableProvider(ctx, config, () => apiKeyResolver())
         .then((outcome) => {
@@ -1495,10 +1655,13 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
             + '可执行 /wb2api-provider 查看现状。'
           console.error(text)
           ctx.logger.error(text)
+          trace(`seed: threw — ${error instanceof Error ? error.message : String(error)}`)
         })
     }, 0)
     timer.unref?.()
     ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: provider seed timer')
+  } else {
+    trace(`seed: 跳过（registerOwnProvider=true —— 自带路由与可编辑 provider 互斥）`)
   }
 
   const origin = gatewayOrigin(config.baseURL)

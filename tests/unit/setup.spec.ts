@@ -454,3 +454,82 @@ describe('renderSetupReport', () => {
     expect(text).toContain('2 个模型')
   })
 })
+
+/**
+ * `/wb2api-setup` 的逐步骤汇报是**用户直接看得见**的，而 `/status.nickname` 在本 build
+ * 实测就是手机号 —— 所以 `ensureAccount` 的两处 detail（"检查账号" / "登录账号"）都必须脱敏。
+ *
+ * 这两条与 `tests/unit/nickname-mask.spec.ts` 分工不同：那边测**规则本身**，
+ * 这边测**规则真的接在了这两条输出上**（只测函数、不测接线，等于没验证泄漏被堵住）。
+ * 同时反向断言英文名**没被误伤** —— 一律打码会让账号列表失去可辨识性。
+ */
+describe('SetupRunner：步骤汇报里的昵称脱敏', () => {
+  const PHONE = '18612345617'
+
+  it('已有账号（"检查账号"步骤）→ 手机号打码，英文名原样', async () => {
+    const root = tempRoot()
+    const store = storeWithAccount(root, 'oneid_1', PHONE)
+    const { runner } = makeRunner({ root, store, supervisor: fakeSupervisor().supervisor })
+
+    const step = (await runner.run(undefined)).steps.find(item => item.title === '检查账号')!
+    expect(step.detail).toContain('186****5617')
+    // 关键：原文一个字符都不能出现（只断言"含打码"会被"打码+原文都在"骗过去）。
+    expect(step.detail).not.toContain(PHONE)
+
+    const root2 = tempRoot()
+    const store2 = storeWithAccount(root2, 'oneid_2', 'alice')
+    const { runner: runner2 } = makeRunner({ root: root2, store: store2, supervisor: fakeSupervisor().supervisor })
+    const step2 = (await runner2.run(undefined)).steps.find(item => item.title === '检查账号')!
+    expect(step2.detail).toContain('alice')
+  })
+
+  it('登录成功后（"登录账号"步骤）→ 手机号打码，英文名原样', async () => {
+    const root = tempRoot()
+    const { runner } = makeRunner({
+      root,
+      store: emptyStore(root),
+      supervisor: fakeSupervisor().supervisor,
+      login: async () => {
+        // 真实登录会落盘；这里模拟同样的最终形态，然后由编排层重新扫描目录。
+        writeFileSync(join(root, 'auths', 'workbuddy-oneid_new.json'), JSON.stringify({
+          account: { uid: 'oneid_new', nickname: PHONE, enterpriseId: '' },
+          auth: { accessToken: 'x', refreshToken: 'y', expiresAt: 1, domain: 'copilot.tencent.com', realm: 'cn' },
+        }))
+        return { ok: true, uid: 'oneid_new' }
+      },
+    })
+
+    const step = (await runner.run('cn')).steps.find(item => item.title === '登录账号')!
+    expect(step.status).toBe('ok')
+    expect(step.detail).toContain('186****5617')
+    expect(step.detail).not.toContain(PHONE)
+
+    const root2 = tempRoot()
+    const { runner: runner2 } = makeRunner({
+      root: root2,
+      store: emptyStore(root2),
+      supervisor: fakeSupervisor().supervisor,
+      login: async () => {
+        writeFileSync(join(root2, 'auths', 'workbuddy-oneid_new.json'), JSON.stringify({
+          account: { uid: 'oneid_new', nickname: '新号', enterpriseId: '' },
+          auth: { accessToken: 'x', refreshToken: 'y', expiresAt: 1, domain: 'copilot.tencent.com', realm: 'cn' },
+        }))
+        return { ok: true, uid: 'oneid_new' }
+      },
+    })
+    const step2 = (await runner2.run('cn')).steps.find(item => item.title === '登录账号')!
+    expect(step2.detail).toContain('新号')
+  })
+
+  it('renderSetupReport 也看不到原文（整份报告的端到端检查）', async () => {
+    const root = tempRoot()
+    const { runner } = makeRunner({
+      root,
+      store: storeWithAccount(root, 'oneid_1', PHONE),
+      supervisor: fakeSupervisor().supervisor,
+    })
+    const text = renderSetupReport(await runner.run(undefined))
+    expect(text).toContain('186****5617')
+    expect(text).not.toContain(PHONE)
+  })
+})

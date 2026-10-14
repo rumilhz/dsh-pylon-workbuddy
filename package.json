@@ -36,6 +36,7 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:all": "vitest run && vitest run --config vitest.e2e.config.ts",
     "test:suites": "node tools/_run-suites.mjs",
+    "cli": "node tools/wb2api.mjs",
     "prepack": "node node_modules/typescript/bin/tsc -p tsconfig.json"
   },
   "dsh": {
