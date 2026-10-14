@@ -265,19 +265,44 @@ export interface SeedDeps {
   /** 拉目录的间隔（毫秒）。 */
   catalogIntervalMs?: number
   /**
-   * provider **已存在**时是否也按网关目录整份覆盖。
+   * provider **已存在**时是否也去网关对一遍清单。
    *
    * · `false` / 缺省 —— 「存在即返回，绝不改写」。这是本模块的核心不变量：
    *   操作员在模型页删掉的模型**绝不能**被自动补回来。
-   * · `true` —— 显式重建（`/wb2api-provider --rebuild`）。**只有操作员当场敲下
+   * · `true` —— 显式刷新（`/wb2api-provider --rebuild`）。**只有操作员当场敲下
    *   这个开关**才会走到这里，插件自己永远不会主动选它。
    *
-   * 重建**必然丢掉筛选**：网关有 45 个模型、操作员只留了 10 个，重建就会把 45 个
-   * 全拉回来。这不是缺陷而是语义 —— 配置里没有"这个模型是被故意删掉的"这种信息，
-   * 所以"只补新增、不恢复已删"在技术上做不到。命令的职责是把这件事**说清楚**，
-   * 而不是假装能做到。
+   * `true` 时走的是**只增不删**：`added = 网关目录 − 配置里已有的 − 墓碑里的`，
+   * 写回的是「你现有的条目**原样** + added」。所以它**不会**复活被删掉的模型，
+   * 代价是它依赖 {@link SeedDeps.readOffered} 那条记忆（没有记录时保守地什么都不加）。
+   *
+   * 字段名保留 `overwrite` 是为了不破坏既有接线；它现在的语义是「刷新」，
+   * 不再是「整份覆盖」。
    */
   overwrite?: boolean
+  /**
+   * 读「上次提供过哪些模型 id」（墓碑集合）。
+   *
+   * · `undefined` 返回值 —— **没有记录**（文件不存在 / 读坏了 / 从来没写过）。
+   *   与「记录是空数组」不同义：前者是「不知道」，后者是「知道，一个都没提供过」。
+   * · 不接线 / 抛错 —— 同样按「没有记录」处理，于是 `--rebuild` 保守地**什么都不加**
+   *   （见 {@link SeedOutcome} 的 `holdReason`）。
+   *
+   * 这条记忆是「只增不删」能成立的**唯一**依据：少了它，"网关有而配置里没有"
+   * 就永远分不清是「新增」还是「你删掉的」。
+   */
+  readOffered?: () => Promise<string[] | undefined>
+  /**
+   * 把「迄今提供过的并集」写回墓碑（下一轮的判据）。
+   *
+   * **调用时机是严格的**：`present` / `created` / `rebuilt`（真写了，或本来就没有
+   * 记录需要先立个基线）才会被调用；`skipped` / `failed` / `rolled-back` **绝不**调用
+   * —— 写失败、回滚、连 settings 都没有的时候，不能让墓碑替一次没发生的写背书记录。
+   *
+   * 它**抛错不影响 provider 写入的结果**：调用方会捕获并在结果的 `stateWarning`
+   * 里注明。墓碑是我们自己的账本，账本丢了可以重记，配置丢了不行。
+   */
+  writeOffered?: (ids: string[]) => Promise<void>
   /**
    * 写路径安全网。**缺席即拒绝写入**（降级成"返回手工块"）。
    *
@@ -289,27 +314,74 @@ export interface SeedDeps {
   sleep?: (ms: number) => Promise<void>
 }
 
-/** {@link seedEditableProvider} 的结果。调用方负责把它渲染成日志/命令输出。 */
+/**
+ * {@link seedEditableProvider} 的结果。调用方负责把它渲染成日志/命令输出。
+ *
+ * `present` / `created` / `rebuilt` 三个分支都会带上 `offeredModels`
+ * （迄今提供过的并集 = 下一轮的墓碑全集），调用方把它原样写回状态文件即可。
+ */
 export type SeedOutcome =
-  | { kind: 'present'; ns: string; modelCount: number }
-  | { kind: 'created'; ns: string; modelCount: number; notes: ProviderModelNote[] }
+  | {
+    kind: 'present'
+    ns: string
+    modelCount: number
+    /**
+     * 迄今提供过的并集。
+     *
+     * 有记录时 = 上一轮墓碑 ∪ 当前配置里的 id；**没有记录时 = 当前配置里的 id，
+     * 但那一条不会落盘**（见 `offeredRecorded`）。
+     */
+    offeredModels: string[]
+    /**
+     * 本次有没有把墓碑写进去。
+     *
+     * `false` 只有一种情形：**本来就没有记录**。此时刻意不从零造一条（用当前配置
+     * 当基线会复活用户在这个版本之前删掉的模型），留给下一次 `--rebuild` 按
+     * 「没有记录」的保守规则处理。
+     */
+    offeredRecorded: boolean
+    /** 墓碑没能写回时的说明；provider 配置本身一个字都没动。 */
+    stateWarning?: string
+  }
+  | {
+    kind: 'created'
+    ns: string
+    modelCount: number
+    notes: ProviderModelNote[]
+    /** 迄今提供过的并集（本轮 = 写进去的全部 id ∪ 上一轮墓碑）。 */
+    offeredModels: string[]
+    /** 墓碑没能写回时的说明；provider 已经写成功了。 */
+    stateWarning?: string
+  }
   /**
-   * 显式重建：provider 已存在，操作员用 `--rebuild` 要求按网关目录整份覆盖。
+   * 显式刷新：provider 已存在，操作员用 `--rebuild` 要求去网关对一遍。
    *
+   * **只增不删** —— `keptModels` 那些条目原样留在配置里，一个都不删。
    * 与 `created` 分开是刻意的：这两件事的**代价**完全不同 —— `created` 是在空位上
-   * 新建，`rebuilt` 是覆盖操作员已经筛过一遍的清单。只有分开，渲染层才能把
-   * "你丢掉了什么"说出来。
+   * 新建，`rebuilt` 动的是操作员已经筛过一遍的清单。
    */
   | {
     kind: 'rebuilt'
     ns: string
-    /** 重建后的模型数（= 网关当前目录大小）。 */
-    modelCount: number
-    /** 重建前配置里的模型数。 */
-    previousModelCount: number
-    /** 重建前配了、而网关现在没有的模型 id（这次之后就不在配置里了）。 */
-    droppedModels: string[]
+    /** 本次真正写进条目的新 id（既不在配置里、也不在墓碑里）。没有新增时是空数组。 */
+    addedModels: string[]
+    /** **写入前**配置里已有的模型个数。★ 是数字，不是数组（渲染层要的是「保留 N 个」）。 */
+    keptModels: number
+    /** 迄今提供过的并集 = 下一轮的墓碑全集。 */
+    offeredModels: string[]
+    /** 备份落点；**本次没有写入时为 undefined**（没写就没有备份）。 */
+    backupPath?: string
+    /** 只针对本次新增的那些模型的字段说明。 */
     notes: ProviderModelNote[]
+    /**
+     * 有值时说明本轮为什么**故意一个都没加**。
+     *
+     * 当前只有一种情形：没有上一次的墓碑记录，因此无法区分「网关新增」与
+     * 「你删掉的」—— 此时**不添加任何东西**是唯一不会复活已删模型的选择。
+     */
+    holdReason?: string
+    /** 墓碑没能写回时的说明；provider 配置的写入结果不受影响。 */
+    stateWarning?: string
   }
   | { kind: 'skipped'; reason: 'no-settings-service' | 'no-namespace'; detail: string }
   /**
@@ -770,6 +842,11 @@ function yamlScalar(value: string): string {
  * 缩进是参数而不是常量：块本身只描述 `providers:` **下面**那一层，要贴进
  * `cordis.patch.yml` 就得对齐 `llm-pi-ai.config` 的层级（见 {@link PASTE_INDENT}）。
  *
+ * **对残缺的条目要宽容**：只增不删的写回会把「操作员现有的条目**原样**」带进来，
+ * 那些条目未必是本模块生成的（可能只有一行 `- id: x`）。渲染器遇到这种输入只补
+ * 缺省（`input` 缺席即仅文本，与 `models.ts` 同一口径），**绝不能抛** ——
+ * 它是在失败路径上给操作员抄的退路，退路自己崩掉就等于没有退路。
+ *
  * @param name - `providers.<name>` 的键名。
  * @param profile - {@link buildProviderProfile} 生成的结果。
  * @param indent - 每行前面补的空格数（默认 0）。
@@ -791,8 +868,11 @@ export function renderProviderProfileYaml(name: string, profile: ProviderProfile
     if (model.name !== undefined) lines.push(`      name: ${yamlScalar(model.name)}`)
     if (model.contextWindow !== undefined) lines.push(`      contextWindow: ${model.contextWindow}`)
     if (model.maxTokens !== undefined) lines.push(`      maxTokens: ${model.maxTokens}`)
+    // 缺席 = 仅文本（与 models.ts 的 supports_images 口径一致），只是为了别让
+    // 一份残缺的既有条目把这段退路渲染搞崩。
+    const modalities = Array.isArray(model.input) ? model.input : ['text']
     lines.push('      input:')
-    for (const modality of model.input) lines.push(`        - ${yamlScalar(modality)}`)
+    for (const modality of modalities) lines.push(`        - ${yamlScalar(modality)}`)
     if (model.reasoningEfforts !== undefined) {
       lines.push('      reasoningEfforts:')
       for (const [level, wire] of Object.entries(model.reasoningEfforts)) {
@@ -854,27 +934,104 @@ export function renderProviderNotes(notes: readonly ProviderModelNote[]): string
 }
 
 /**
+ * 取一份 provider 段里的 `models` **数组本身**（拿不到就给空数组）。
+ *
+ * 与 {@link modelIds} 的区别：这里不抽取 id，而是把条目**原对象**留着 ——
+ * 只增不删的写回要的是「用户现有条目**原样**」，不是重新生成一份。
+ *
+ * @param providerValue - `providers.<name>` 的值。
+ * @returns 原数组的浅拷贝；不是数组时 `[]`。
+ */
+function modelEntries(providerValue: unknown): unknown[] {
+  const models = (providerValue as { models?: unknown } | null | undefined)?.models
+  return Array.isArray(models) ? [...models] : []
+}
+
+/** 并集（去重，保持首次出现的顺序）。墓碑集合的每一处合并都走它。 */
+function unionIds(...groups: ReadonlyArray<readonly string[]>): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const group of groups) {
+    for (const id of group) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      out.push(id)
+    }
+  }
+  return out
+}
+
+/**
+ * 读墓碑：**读不到就是「没有记录」**。
+ *
+ * 没接线、抛错、返回 `undefined` 三种情形在这里被收敛成同一个语义（没有记录），
+ * 于是 `--rebuild` 会走保守路径 —— 少加几个模型是可以接受的，复活已删模型不行。
+ */
+async function readOfferedSafe(deps: SeedDeps): Promise<string[] | undefined> {
+  if (deps.readOffered === undefined) return undefined
+  try {
+    return await deps.readOffered()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 写墓碑。**失败只回一句话，绝不抛给调用方**。
+ *
+ * 这条边界是刻意的：墓碑是我们自己的账本，写不进去只该「下次重新记」，
+ * 不该把一次**已经成功**的 provider 写入报告成失败。
+ *
+ * @returns 失败说明；成功或没接线时 undefined。
+ */
+async function commitOffered(deps: SeedDeps, ids: string[]): Promise<string | undefined> {
+  if (deps.writeOffered === undefined) return undefined
+  try {
+    await deps.writeOffered(ids)
+    return undefined
+  } catch (error) {
+    return `墓碑集合没能写回（**不影响本次 provider 写入**）：${error instanceof Error ? error.message : String(error)}`
+      + ' —— 下一次刷新会重新记录。'
+  }
+}
+
+/** 没有上一次记录时 `rebuilt` 的固定说明（渲染层直接印）。 */
+const NO_BASELINE_HOLD = '没有上一次的「提供过哪些」记录，无法区分「网关新增」与「你删掉的」'
+  + ' —— 本次**一个都不加**（加错就是复活你删掉的模型）。'
+  + '本次已把网关当前目录记为基线，之后的刷新只会补真正新增的。'
+
+/**
  * 保证「设置 → 模型」里那份可编辑 provider 存在。**默认存在即返回，绝不改写。**
  *
  * 顺序：
  *  1. 等 Loader 把 profile 条目激活后探测 namespace（可重试）；
- *  2. provider 已存在 → 直接返回 `present`，**连 `/v1/models` 都不拉**
- *     （`deps.overwrite === true` 时越过这一步，见下）；
- *  3. 缺失（或显式重建）→ 拉网关目录（可重试）；
- *  4. **写前**：`guard.snapshot()` 把整份 patch 备份到 profile 之外；**备份不了就不写**；
- *  5. `mutate` 写入 `['providers', <name>]`；
- *  6. **写后**：`guard.verify()` 独立读回核对条目数；判定不可信 → `guard.rollback()`
+ *  2. provider 已存在且没要求刷新 → 直接返回 `present`，**连 `/v1/models` 都不拉**，
+ *     只把「迄今提供过的并集」续进墓碑（本来没有记录时不从零造，见下）；
+ *  3. 缺失 → 拉网关目录（可重试），整份创建（`created`）；
+ *  4. `deps.overwrite === true`（`/wb2api-provider --rebuild`）且已存在 → 拉网关目录，
+ *     但走**只增不删**：`added = 目录 − 配置里已有的 − 墓碑里的`，写回
+ *     「现有条目原样 + added」；`added` 为空时**一个字节都不写**；
+ *  5. **写前**：`guard.snapshot()` 把整份 patch 备份到 profile 之外；**备份不了就不写**；
+ *  6. `mutate` 写入 `['providers', <name>]`；
+ *  7. **写后**：`guard.verify()` 独立读回核对条目数；判定不可信 → `guard.rollback()`
  *     把备份盖回去，返回 `rolled-back`；
- *  7. 任何一步失败 → 返回 `failed` 并附上可粘贴的 YAML（拿得到目录时）。
+ *  8. 任何一步失败 → 返回 `failed` 并附上可粘贴的 YAML（拿得到目录时）。
  *
- * `deps.overwrite === true`（`/wb2api-provider --rebuild`）让第 2 步放行，于是已存在的
- * provider 也会被整份覆盖 —— **代价是丢掉操作员的筛选**。所以只有操作员当场敲下那个
- * 开关才会走到这里，插件自己永远不会主动选它。
+ * **墓碑（`readOffered` / `writeOffered`）是「只增不删」的唯一记忆载体**：一个 id
+ * 只要曾经被提供过，就永远进不了 `added`。没有记录时（或没接线时）`--rebuild`
+ * 保守地什么都不加，并把原因写进 `holdReason` —— 宁可少加，不可复活。
+ *
+ * 两处**刻意保守**的地方（都会在真机上出现，不是理论情形）：
+ *   · `present` **不从零造记录** —— 当前配置只说明"用户留着这些"，不说明"我们提供过
+ *     这些"；拿它当基线，下一次 `--rebuild` 就会把用户在这个版本之前删掉的模型
+ *     全部加回来。
+ *   · 因此「没有记录」会一直保留到下一次 `--rebuild`，由它按 `holdReason` 那条规则
+ *     处理：一个都不加，同时把网关当前目录立成基线，记忆从那一刻开始生效。
  *
  * 函数本身**不写日志**：返回结构化结果，由调用方渲染。这样它在单测里不需要
  * cordis，也不需要真网关。
  *
- * @param deps - settings 服务、provider 名、目录来源与写路径安全网。
+ * @param deps - settings 服务、provider 名、目录来源、墓碑与写路径安全网。
  * @returns 本次的动作与说明。
  */
 export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome> {
@@ -911,16 +1068,29 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
   const existing = namespace.providers[deps.providerName]
   const alreadyExists = providerExists(namespace, deps.providerName)
   // ★ 核心不变量：provider 已存在就返回，连 `/v1/models` 都不拉。
-  //   只有操作员显式要求 overwrite（`/wb2api-provider --rebuild`）才越过它。
+  //   只有操作员显式要求刷新（`/wb2api-provider --rebuild`）才越过它。
   if (alreadyExists && deps.overwrite !== true) {
+    // present 在有记录时**续**墓碑（只增不减：用户删过的 id 绝不能被这一轮抹掉，
+    // 否则下一次 --rebuild 就会把它加回来）。
+    //
+    // ★ 没有记录时**不**拿当前配置去造一条基线：配置里的 id 只说明「用户留着它们」，
+    //   不说明「我们提供过它们」。拿它当基线，下一次 --rebuild 就会把用户（在这个
+    //   版本之前）删掉的模型全部加回来 —— 那正是这套机制要防的事。
+    //   于是「没有记录」这个状态被**保留**到下一次 --rebuild，由它按保守规则处理
+    //   （一个都不加 + 把网关目录立成基线）。
+    const currentIds = modelIds(existing)
+    const offeredBefore = await readOfferedSafe(deps)
+    const offeredModels = offeredBefore === undefined ? currentIds : unionIds(offeredBefore, currentIds)
+    const stateWarning = offeredBefore === undefined ? undefined : await commitOffered(deps, offeredModels)
     return {
       kind: 'present',
       ns: namespace.ns,
       modelCount: countModels(existing),
+      offeredModels,
+      offeredRecorded: offeredBefore !== undefined,
+      ...(stateWarning === undefined ? {} : { stateWarning }),
     }
   }
-  const previousModelCount = alreadyExists ? countModels(existing) : 0
-
   let entries: GatewayCatalogEntry[] | undefined
   let lastError = ''
   for (let attempt = 1; attempt <= catalogAttempts; attempt += 1) {
@@ -942,6 +1112,141 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
   }
 
   const build = buildProviderProfile(entries, { apiKeyEnv: deps.apiKeyEnv, baseURL: deps.baseURL })
+
+  // ── 分支 1：只增不删（`--rebuild` 且 provider 已存在） ─────────────────────
+  // 判据是「**从没提供过**」，不是「目录里有、条目里没有」：
+  //   added = 目录 − 配置里已有的（kept，用户留着的） − 墓碑（offered，我们提供过的）
+  // 少了 offered 这一半，用户删掉的模型下一次刷新就会回来 —— 那正是这一整套机制
+  // 存在的理由。
+  if (alreadyExists) {
+    const keptIds = modelIds(existing)
+    const keptSet = new Set(keptIds)
+    const offeredBefore = await readOfferedSafe(deps)
+    // undefined = 没有记录（≠ 记录是空数组）。没有记录时**保守地什么都不加**。
+    const hasBaseline = offeredBefore !== undefined
+    const offeredSet = new Set(offeredBefore ?? [])
+    const catalogIds = build.profile.models.map(model => model.id)
+    const addedModels = hasBaseline
+      ? build.profile.models.filter(model => !keptSet.has(model.id) && !offeredSet.has(model.id))
+      : []
+    const addedIds = addedModels.map(model => model.id)
+    const keptModels = countModels(existing)
+    // 用户现有的条目**原样**带过去（不改数值、不重排、不丢弃）：只增不删的全部含义
+    // 就在这一行。网关那边如今也有这些 id 时，去覆盖操作员在模型页调过的数值
+    // 不是本命令的职责。
+    const existingModels = modelEntries(existing) as ProviderModelProfile[]
+    const mergedModels: ProviderModelProfile[] = [...existingModels, ...addedModels]
+    // 手工块按**合并后**的清单渲染：万一写入失败，操作员把它贴回去得到的就是
+    // 「只增不删」的那份结果，而不是"按网关整份覆盖"的老行为。
+    const manualBlock = renderProviderProfileYaml(
+      deps.providerName,
+      { ...build.profile, models: mergedModels },
+      PASTE_INDENT,
+    )
+    // 新增模型的字段说明只保留新增的那些：没写进去的模型不需要人核对。
+    const notes = build.notes.filter(note => addedIds.includes(note.id))
+
+    // 没有新增 ⇒ **不写 patch**（无意义的写入只会把 patch 的 mtime 搅乱，
+    // 还会白跑一次备份/核对）。但墓碑仍要立起来，否则机制永远不会开始工作。
+    if (addedIds.length === 0) {
+      const offeredModels = hasBaseline
+        ? unionIds(offeredBefore ?? [], keptIds)
+        : unionIds(keptIds, catalogIds)
+      // 「rebuilt 且真写了」才写回墓碑 —— 唯一的例外是**本来就没有记录**：
+      // 那时必须先把基线记下来，否则每一次刷新都会永远停在「一个都不加」。
+      const stateWarning = hasBaseline ? undefined : await commitOffered(deps, offeredModels)
+      return {
+        kind: 'rebuilt',
+        ns: namespace.ns,
+        addedModels: [],
+        keptModels,
+        offeredModels,
+        notes: [],
+        ...(hasBaseline ? {} : { holdReason: NO_BASELINE_HOLD }),
+        ...(stateWarning === undefined ? {} : { stateWarning }),
+      }
+    }
+
+    // ── 铁律 ①：写前备份，且备份必须落在 profile 之外 ────────────────────────
+    // 这里有两个"不写"的分支：没接线安全网、以及备份失败。
+    if (deps.guard === undefined) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: '没有接线写路径安全网（WriteGuard），已放弃写入 —— 见 PROJECT.md §0「写配置铁律」。'
+          + '插件不在没有退路的情况下改用户配置。',
+        manualBlock,
+        notes,
+      }
+    }
+    let baseline: WriteBaseline
+    try {
+      baseline = await deps.guard.snapshot()
+    } catch (error) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: `写入前备份失败，已放弃写入：${error instanceof Error ? error.message : String(error)}`,
+        manualBlock,
+        notes,
+      }
+    }
+
+    try {
+      await settings.mutate(
+        namespace.ns,
+        [{ op: 'set', path: ['providers', deps.providerName], value: { ...build.profile, models: mergedModels } }],
+        namespace.revision,
+      )
+    } catch (error) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: error instanceof Error ? error.message : String(error),
+        manualBlock,
+        notes,
+      }
+    }
+
+    // ── 铁律 ②③：写后读回核对条目数；条目少了立即回滚 ────────────────────────
+    const verdict = await deps.guard.verify(baseline, { modelCount: mergedModels.length })
+    if (verdict.ok) {
+      const offeredModels = unionIds(offeredBefore ?? [], keptIds, addedIds)
+      const stateWarning = await commitOffered(deps, offeredModels)
+      return {
+        kind: 'rebuilt',
+        ns: namespace.ns,
+        addedModels: addedIds,
+        keptModels,
+        offeredModels,
+        backupPath: baseline.backupPath,
+        notes,
+        ...(stateWarning === undefined ? {} : { stateWarning }),
+      }
+    }
+    // 恢复优先于报告：先把文件盖回去，再组织措辞。
+    let recovery: string
+    try {
+      await deps.guard.rollback(baseline)
+      recovery = `已从备份整份盖回（${baseline.backupPath}），配置与写入前一致。`
+        + 'DSH 会热加载 profile patch；若没生效，重启一次即可。'
+    } catch (error) {
+      recovery = `⚠ 回滚失败：${error instanceof Error ? error.message : String(error)}`
+        + `\n请手工把 ${baseline.backupPath} 覆盖回 profile 的 cordis.patch.yml。`
+    }
+    // ★ 回滚分支**不写墓碑**：这次写入没被采信，墓碑就不能替它背书。
+    return {
+      kind: 'rolled-back',
+      ns: namespace.ns,
+      reasons: verdict.reasons,
+      backupPath: baseline.backupPath,
+      recovery,
+      manualBlock,
+      notes,
+    }
+  }
+
+  // ── 分支 2：创建（provider 本来就不存在） ──────────────────────────────────
   const manualBlock = renderProviderProfileYaml(deps.providerName, build.profile, PASTE_INDENT)
 
   // ── 铁律 ①：写前备份，且备份必须落在 profile 之外 ──────────────────────────
@@ -992,18 +1297,17 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
   // 从 34 条目变成 3 条目。所以"写入成功"必须再被独立确认一次。
   const verdict = await deps.guard.verify(baseline, { modelCount: build.profile.models.length })
   if (verdict.ok) {
-    if (!alreadyExists) {
-      return { kind: 'created', ns: namespace.ns, modelCount: build.profile.models.length, notes: build.notes }
-    }
-    // 重建：把"你丢掉了哪些"算出来 —— 只报一个数字等于没说。
-    const kept = new Set(build.profile.models.map(model => model.id))
+    const writtenIds = build.profile.models.map(model => model.id)
+    // created 是"第一次全都算提供过"：此刻写进去的每一个 id 都进了墓碑。
+    const offeredModels = unionIds((await readOfferedSafe(deps)) ?? [], writtenIds)
+    const stateWarning = await commitOffered(deps, offeredModels)
     return {
-      kind: 'rebuilt',
+      kind: 'created',
       ns: namespace.ns,
       modelCount: build.profile.models.length,
-      previousModelCount,
-      droppedModels: modelIds(existing).filter(id => !kept.has(id)),
       notes: build.notes,
+      offeredModels,
+      ...(stateWarning === undefined ? {} : { stateWarning }),
     }
   }
   // 恢复优先于报告：先把文件盖回去，再组织措辞。
@@ -1016,6 +1320,7 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
     recovery = `⚠ 回滚失败：${error instanceof Error ? error.message : String(error)}`
       + `\n请手工把 ${baseline.backupPath} 覆盖回 profile 的 cordis.patch.yml。`
   }
+  // ★ 回滚分支**不写墓碑**：这次写入没被采信，墓碑就不能替它背书。
   return {
     kind: 'rolled-back',
     ns: namespace.ns,

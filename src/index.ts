@@ -32,10 +32,12 @@ import {
   renderProviderNotes,
   seedEditableProvider,
   type ProviderProfile,
+  type SeedDeps,
   type SeedOutcome,
   type SettingsServiceLike,
   type WriteGuard,
 } from './provider-config.js'
+import { openTombstone } from './plugin-state.js'
 import {
   defaultBackupDir,
   judgeWrite,
@@ -225,16 +227,47 @@ function createWriteGuard(ctx: Context, config: GatewayPluginConfig): WriteGuard
 }
 
 /**
+ * 把「只增不删」的记忆载体 —— **墓碑集合** —— 接到 provider 写入路径上。
+ *
+ * 落点是 `<DSH_HOME>/.wb2api/state.json`（**有点**；网关自己的工作目录是
+ * `~/.dsh/wb2api/`，**没点**，两个不同目录，绝不能撞）。
+ *
+ * home 依次取 `profileContext.home` → 环境变量 `DSH_HOME` → `os.homedir()/.dsh`。
+ * **一条都拿不到时返回空对象**：于是 `seedEditableProvider` 会按「没有墓碑」处理，
+ * `--rebuild` 退化成保守的「什么都不加」，而不是抛错。降级方向是刻意的 ——
+ * 少一个能力不等于启动失败，更不等于"那就整份覆盖吧"。
+ *
+ * @param ctx - 插件上下文（取 profileContext.home）。
+ * @param config - 插件配置（取 provider 名）。
+ * @returns 注入给 `seedEditableProvider` 的两个可选依赖；启用不了时是空对象。
+ */
+function createTombstoneWiring(
+  ctx: Context,
+  config: GatewayPluginConfig,
+): Pick<SeedDeps, 'readOffered' | 'writeOffered'> {
+  const profile = ctx.get('profileContext') as ProfileContextLike | undefined
+  const tombstone = openTombstone({ providerName: config.providerName, profileHome: profile?.home })
+  if (tombstone === undefined) return {}
+  return {
+    readOffered: async () => tombstone.read(),
+    // 抛错由 seedEditableProvider 捕获并记进结果的 stateWarning —— 墓碑写不进去
+    // 绝不能把一次**已经成功**的 provider 写入报告成失败。
+    writeOffered: async (ids: string[]) => { tombstone.write(ids) },
+  }
+}
+
+/**
  * 把「可编辑 provider 是否存在」这件事收敛成一次调用。
  *
  * `fetchEntries` 默认只在 provider **缺失**时才会被调用（存在性判定在拉目录之前），
  * 所以日常启动不会多打一次 `/v1/models`。`overwrite` 为 true 时（`--rebuild`）
- * 已存在的 provider 也会被覆盖，那时才会去拉目录。
+ * 已存在的 provider 也会去对一遍目录，那时才会去拉目录 —— 但走的仍是**只增不删**
+ * （见 `provider-config.ts` 的 `rebuilt` 分支）。
  *
  * @param ctx - 插件上下文。
  * @param config - 插件配置。
  * @param resolveApiKey - 取网关凭据。
- * @param overwrite - 已存在时是否整份覆盖；默认 false（绝不改写）。
+ * @param overwrite - 已存在时是否去网关对一遍清单（只增不删）；默认 false（绝不改写）。
  * @returns 本次的动作与说明。
  */
 async function ensureEditableProvider(
@@ -252,6 +285,7 @@ async function ensureEditableProvider(
     baseURL: config.baseURL,
     overwrite,
     guard: createWriteGuard(ctx, config),
+    ...createTombstoneWiring(ctx, config),
     fetchEntries: async () => readCatalogEntries(await fetchModelList({
       baseURL: config.baseURL,
       apiKey: await resolveApiKey(),
@@ -275,47 +309,62 @@ function manualBlockHeader(): string {
  * @param config - 插件配置（取 provider 名与端点）。
  * @returns 多行文本（不带前缀，调用方决定 logger 级别）。
  */
+/** 墓碑写回失败时的附加说明（不影响 provider 本身的结果，所以只挂一行）。 */
+function renderStateWarning(warning: string | undefined): string {
+  return warning === undefined ? '' : `\n⚠ ${warning}`
+}
+
 function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): string {
   const name = config.providerName
   switch (outcome.kind) {
     case 'present':
       return `可编辑 provider "${name}" 已存在于 settings 条目 "${outcome.ns}"（${outcome.modelCount} 个模型）`
         + ' —— 未做任何改动（存在即不碰，操作员筛选过的模型不会被补回来）。'
+        + (outcome.offeredRecorded
+          ? `\n已续上 ${outcome.offeredModels.length} 个「迄今提供过」的模型 id`
+            + '（下次 /wb2api-provider --rebuild 只补网关真正新增的）。'
+          : '\n（没有「迄今提供过」的记录可续 —— 插件**不会**拿你当前的清单去造一条：'
+            + '那会让下一次 --rebuild 把你删掉的模型全加回来。下次 --rebuild 会先按'
+            + '「没有记录」处理：一个都不加，并把网关目录立成基线。）')
+        + renderStateWarning(outcome.stateWarning)
     case 'created': {
       const lines = [
         `已创建可编辑 provider "${name}"（settings 条目 "${outcome.ns}"，${outcome.modelCount} 个模型，`
         + `上下文窗口与输出上限全部来自网关 /v1/models 的实测值）。`,
         '现在可以在「设置 → 模型」里增删这个 provider 的模型；删掉之后插件不会再补回来。',
+        `已把这 ${outcome.offeredModels.length} 个 id 记为「提供过」—— 今后 /wb2api-provider --rebuild 只补网关新增的。`,
       ]
       if (outcome.notes.length > 0) {
         lines.push('生成时有字段被略过（插件不猜数值，请自行核对）：')
         lines.push(...renderProviderNotes(outcome.notes))
       }
-      return lines.join('\n')
+      return lines.join('\n') + renderStateWarning(outcome.stateWarning)
     }
     case 'rebuilt': {
-      const delta = outcome.modelCount - outcome.previousModelCount
-      const lines = [
-        `已按网关目录**重建** provider "${name}"（settings 条目 "${outcome.ns}"）：`
-        + `${outcome.previousModelCount} → ${outcome.modelCount} 个模型。`,
-        delta > 0
-          ? `（净增 ${delta} 个 —— 既有网关新增的，也有你之前在模型页删掉、这次被拉回来的。）`
-          : delta < 0
-            ? `（净减 ${-delta} 个 —— 网关下架或改名了。）`
-            : '（数量没变，但数值已按网关当前的实测值重写。）',
-      ]
-      if (outcome.droppedModels.length > 0) {
-        lines.push(`⚠ 下面这 ${outcome.droppedModels.length} 个模型你原本配置里有、而网关现在没有了，`
-          + '重建之后**不再出现在清单里**：')
-        lines.push(`  ${outcome.droppedModels.join(', ')}`)
+      const total = outcome.keptModels + outcome.addedModels.length
+      const lines: string[] = []
+      if (outcome.holdReason !== undefined) {
+        // 没有记录时**故意什么都不加**：加错就是复活用户删掉的模型。
+        lines.push(`⚠ 没有刷新 provider "${name}"（settings 条目 "${outcome.ns}"）：${outcome.holdReason}`)
+        lines.push(`本次保留 ${outcome.keptModels} 个模型，新增 0 个。`)
+      } else if (outcome.addedModels.length === 0) {
+        lines.push(`provider "${name}"（settings 条目 "${outcome.ns}"）已是最新：`
+          + `保留 ${outcome.keptModels} 个模型，新增 0 个 —— 网关没有你还没见过的模型。`)
+      } else {
+        lines.push(`已按「**只增不删**」刷新 provider "${name}"（settings 条目 "${outcome.ns}"）：`
+          + `保留 ${outcome.keptModels} 个，新增 ${outcome.addedModels.length} 个（共 ${total} 个）。`)
+        lines.push(`新增：${outcome.addedModels.join(', ')}`)
       }
-      lines.push('⚠ 这次是**整份覆盖**：你在「设置 → 模型」里删掉的模型已经全部回来。'
-        + '\n（写前已备份到 profile 之外，写后核对过条目数；核对不通过会自动回滚并说明。）')
+      lines.push('你在「设置 → 模型」里删掉的模型**不会**回来 —— 刷新只补网关新增的；'
+        + `墓碑里已记下 ${outcome.offeredModels.length} 个「提供过」的 id。`)
+      lines.push(outcome.backupPath === undefined
+        ? '本次没有新增，所以一个字节都没写（也没有动安全网）。'
+        : `写前已备份到 profile 之外（${outcome.backupPath}），写后核对过条目数；核对不通过会自动回滚并说明。`)
       if (outcome.notes.length > 0) {
-        lines.push('生成时有字段被略过（插件不猜数值，请自行核对）：')
+        lines.push('新增的模型里有字段被略过（插件不猜数值，请自行核对）：')
         lines.push(...renderProviderNotes(outcome.notes))
       }
-      return lines.join('\n')
+      return lines.join('\n') + renderStateWarning(outcome.stateWarning)
     }
     case 'skipped':
       return outcome.reason === 'no-settings-service'
@@ -864,17 +913,17 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
 
   ctx.commands.register({
     name: 'wb2api-provider',
-    description: '查看可编辑 provider 与网关目录的差异（只读）；--create 缺失时创建；--rebuild 按网关整份重建',
+    description: '查看可编辑 provider 与网关目录的差异（只读）；--create 缺失时创建；--rebuild 只增不删地补上网关新增的',
     input: { hint: '[--create|--rebuild]' },
     handler: async ({ rawInput }): Promise<CommandResult> => {
       try {
         const wantsCreate = /(^|\s)--create(\s|$)/.test(rawInput)
         const wantsRebuild = /(^|\s)--rebuild(\s|$)/.test(rawInput)
         if ((wantsCreate || wantsRebuild) && !config.registerOwnProvider) {
-          // `--rebuild` 与 `--create` 的唯一区别是**已存在时也覆盖**。
+          // `--rebuild` 与 `--create` 的唯一区别是**已存在时也去对一遍目录**。
           const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver(), wantsRebuild)
           const header = wantsRebuild
-            ? '（显式 --rebuild：按网关目录整份覆盖现有清单 —— 你在模型页做的筛选会被覆盖。'
+            ? '（显式 --rebuild：**只增不删** —— 只补网关新增的模型，你在模型页删掉的不会复活。'
               + '写入带安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。）\n'
             : '（显式 --create：仅在 provider 缺失时创建，从不改写已有模型清单）\n'
           return {
@@ -939,7 +988,8 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           : '\n数值与网关不一致的: 无'
         body += '\n\n（本命令只读，不写任何东西。）'
           + '\n· /wb2api-provider --create  —— 仅在 provider 缺失时创建，绝不改写已有清单。'
-          + '\n· /wb2api-provider --rebuild —— 按网关目录整份重建（**会覆盖你在模型页做的筛选**）。'
+          + '\n· /wb2api-provider --rebuild —— **只增不删**：只补网关新增的模型，'
+          + '你在模型页删掉的不会复活（依据是插件自己记的「迄今提供过哪些 id」）。'
           + '\n两者都带写路径安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。'
         return { kind: 'success', text: body }
       } catch (error) {

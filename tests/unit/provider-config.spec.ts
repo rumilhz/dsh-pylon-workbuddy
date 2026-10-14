@@ -21,6 +21,7 @@ import {
   seedEditableProvider,
   THINKING_LEVELS,
   type ProviderProfile,
+  type SeedDeps,
   type SettingsDescriptor,
   type SettingsServiceLike,
   type WriteGuard,
@@ -463,6 +464,22 @@ describe('renderProviderProfileYaml', () => {
     expect(yaml).toContain('name: ""')
     expect(yaml).toContain('- id: "on"')
   })
+
+  it('🔴 残缺的既有条目（只有一行 - id）不会把渲染搞崩，input 按「仅文本」补', () => {
+    // 只增不删的写回会把操作员手写的旧条目原样带进来 —— 它们未必是本模块生成的。
+    // 这段渲染在**失败路径**上给操作员抄退路，退路自己崩掉就等于没有退路。
+    const profile = {
+      apiKeyEnv: 'K',
+      api: 'openai-completions',
+      baseURL: 'http://h/v1',
+      retryPolicy: { mode: 'normal', maxRetries: 0 },
+      models: [{ id: 'bare' } as unknown as ProviderProfile['models'][number]],
+    }
+    let yaml = ''
+    expect(() => { yaml = renderProviderProfileYaml('workbuddy', profile) }).not.toThrow()
+    expect(yaml).toContain('- id: bare')
+    expect(yaml).toContain('        - text')
+  })
 })
 
 describe('diffProviderModels', () => {
@@ -519,7 +536,9 @@ describe('seedEditableProvider', () => {
       },
       fetchEntries,
     })
-    expect(outcome).toEqual({ kind: 'present', ns: 'llm-pi-ai', modelCount: 2 })
+    expect(outcome).toEqual({
+      kind: 'present', ns: 'llm-pi-ai', modelCount: 2, offeredModels: ['a', 'b'], offeredRecorded: false,
+    })
     expect(fetchEntries).not.toHaveBeenCalled()
     expect(mutate).not.toHaveBeenCalled()
   })
@@ -747,26 +766,56 @@ describe('seedEditableProvider', () => {
     })
   })
 
-  describe('--rebuild（显式整份覆盖）', () => {
-    /** provider 已存在（配了 kept + gone）、而网关现在有 kept + brand-new 的现场。 */
-    const siteExistingProvider = (onMutate?: (ns: string, ops: unknown[], rev?: number) => void) => ({
-      settings: fakeSettings(
-        [{
-          ns: 'llm-pi-ai',
-          revision: 9,
-          schema: providersForm(),
-          value: { providers: { workbuddy: { models: [{ id: 'kept' }, { id: 'gone' }] } } },
-        }],
-        onMutate,
-      ),
-      fetchEntries: async () => [
-        entry('kept', { contextLength: 100, maxOutputTokens: 10 }),
-        entry('brand-new', { contextLength: 200, maxOutputTokens: 20 }),
-      ],
-    })
+  describe('--rebuild（只增不删 / 墓碑集合）', () => {
+    /**
+     * 造一个「provider 已存在、网关目录给定」的现场。
+     *
+     * `offered` 是墓碑（上一次提供过的 id）：`undefined` = **没有记录**，
+     * 空数组 = **有记录，一个都没提供过**。这两个语义分开是本组的重点之一。
+     */
+    function site(options: {
+      models: unknown[]
+      catalog: string[]
+      offered?: string[] | undefined
+      readThrows?: boolean
+      onMutate?: (ns: string, ops: unknown[], rev?: number) => void
+      guard?: WriteGuard
+    }): { deps: SeedDeps; writes: string[][] } {
+      const writes: string[][] = []
+      const deps: SeedDeps = {
+        ...baseDeps,
+        // 现场默认就是「操作员敲了 --rebuild」——这一组的全部用例都在验刷新路径。
+        overwrite: true,
+        settings: fakeSettings(
+          [{
+            ns: 'llm-pi-ai',
+            revision: 9,
+            schema: providersForm(),
+            value: { providers: { workbuddy: { apiKeyEnv: 'X', models: options.models } } },
+          }],
+          options.onMutate,
+        ),
+        fetchEntries: async () =>
+          options.catalog.map(id => entry(id, { contextLength: 100, maxOutputTokens: 10 })),
+        readOffered: async () => {
+          if (options.readThrows === true) throw new Error('EACCES: 读不到状态文件')
+          return options.offered
+        },
+        writeOffered: async (ids) => { writes.push([...ids]) },
+        guard: options.guard ?? fakeGuard(),
+      }
+      return { deps, writes }
+    }
+
+    /** 取某次 mutate 写进去的模型 id 列表。 */
+    function writtenIds(ops: unknown[]): string[] {
+      const value = (ops[0] as { value?: { models?: Array<{ id?: unknown }> } }).value
+      return (value?.models ?? []).map(model => String(model.id))
+    }
 
     it('🔴 缺省（不 overwrite）时已存在 → present，连目录都不拉', async () => {
       const fetchEntries = vi.fn(async () => [entry('x')])
+      const mutate = vi.fn(async () => {})
       const outcome = await seedEditableProvider({
         ...baseDeps,
         settings: fakeSettings([{
@@ -774,72 +823,380 @@ describe('seedEditableProvider', () => {
           revision: 9,
           schema: providersForm(),
           value: { providers: { workbuddy: { models: [{ id: 'kept' }] } } },
-        }]),
+        }], mutate),
         fetchEntries,
         guard: fakeGuard(),
       })
-      expect(outcome).toEqual({ kind: 'present', ns: 'llm-pi-ai', modelCount: 1 })
+      expect(outcome).toEqual({
+        kind: 'present', ns: 'llm-pi-ai', modelCount: 1, offeredModels: ['kept'], offeredRecorded: false,
+      })
       expect(fetchEntries).not.toHaveBeenCalled()
+      expect(mutate).not.toHaveBeenCalled()
     })
 
-    it('overwrite=true 时已存在也重写，并回传 rebuilt 与「丢掉了哪些」', async () => {
+    it('🔴 核心不变量：用户删掉的 id 不会复活（kept=[a]、墓碑=[a,b]、网关=[a,b,c] ⇒ 只加 c）', async () => {
       const calls: Array<{ ns: string; ops: unknown[]; rev?: number }> = []
-      const outcome = await seedEditableProvider({
-        ...baseDeps,
-        ...siteExistingProvider((ns, ops, rev) => { calls.push({ ns, ops, rev }) }),
-        overwrite: true,
-        guard: fakeGuard(),
+      const { deps, writes } = site({
+        models: [{ id: 'a' }],
+        catalog: ['a', 'b', 'c'],
+        offered: ['a', 'b'],
+        onMutate: (ns, ops, rev) => { calls.push({ ns, ops, rev }) },
       })
+      const outcome = await seedEditableProvider(deps)
       expect(outcome.kind).toBe('rebuilt')
       if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
-      expect(outcome.modelCount).toBe(2)
-      expect(outcome.previousModelCount).toBe(2)
-      // 'gone' 原本配了、网关现在没有 → 重建后不在清单里，必须被点名。
-      expect(outcome.droppedModels).toEqual(['gone'])
+      expect(outcome.addedModels).toEqual(['c'])
+      expect(outcome.keptModels).toBe(1)
+      expect(outcome.offeredModels).toEqual(['a', 'b', 'c'])
       expect(calls.length).toBe(1)
       expect(calls[0].rev).toBe(9)
+      // b 在墓碑里 ⇒ 不写回去；a 原样保留。
+      expect(writtenIds(calls[0].ops)).toEqual(['a', 'c'])
+      // 墓碑 = 上一轮 ∪ 保留的 ∪ 新增的（删掉过的 b 不能被抹掉，否则下一轮它就会回来）
+      expect(writes).toEqual([['a', 'b', 'c']])
     })
 
-    it('overwrite=true 但 provider 本来缺失 → 仍然是 created（不是 rebuilt）', async () => {
-      const outcome = await seedEditableProvider({
-        ...baseDeps,
-        settings: fakeSettings([{ ns: 'llm-pi-ai', revision: 1, schema: providersForm(), value: { providers: {} } }]),
-        fetchEntries: async () => [entry('a', { contextLength: 1, maxOutputTokens: 1 })],
-        overwrite: true,
-        guard: fakeGuard(),
+    it('🔴 没有墓碑记录时：一个都不加，把原因说出来，并立起基线', async () => {
+      const mutate = vi.fn(async () => {})
+      const { deps, writes } = site({
+        models: [{ id: 'a' }, { id: 'b' }],
+        catalog: ['a', 'b', 'c'],
+        offered: undefined,
+        onMutate: mutate,
       })
-      expect(outcome.kind).toBe('created')
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual([])
+      expect(outcome.keptModels).toBe(2)
+      expect(outcome.holdReason).toContain('没有上一次')
+      expect(outcome.holdReason).toContain('一个都不加')
+      expect(mutate).not.toHaveBeenCalled()
+      // 基线 = 保留的 ∪ 网关当前目录：本次一个都没加，但从这一刻起机制开始工作。
+      expect(writes).toEqual([['a', 'b', 'c']])
     })
 
-    it('🔴 重建同样过安全网：条目变少 → rolled-back', async () => {
+    it('🔴 added 为空 ⇒ 不写 patch、不碰安全网、不写墓碑', async () => {
+      let snapshotCalls = 0
+      const mutate = vi.fn(async () => {})
+      const { deps, writes } = site({
+        models: [{ id: 'a' }, { id: 'b' }],
+        catalog: ['a', 'b'],
+        offered: ['a', 'b', 'c'],
+        onMutate: mutate,
+        guard: fakeGuard({
+          snapshot: async () => {
+            snapshotCalls += 1
+            return { backupPath: 'b', entryCount: 34, bytes: 1 }
+          },
+        }),
+      })
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual([])
+      expect(outcome.holdReason).toBeUndefined()
+      expect(outcome.backupPath).toBeUndefined()
+      expect(mutate).not.toHaveBeenCalled()
+      expect(snapshotCalls).toBe(0)
+      expect(writes).toEqual([])
+    })
+
+    it('🔴「墓碑是空数组」≠「没有记录」：知道一个都没提供过 ⇒ 该加的都加', async () => {
+      const { deps } = site({ models: [{ id: 'a' }], catalog: ['a', 'b'], offered: [] })
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual(['b'])
+      expect(outcome.holdReason).toBeUndefined()
+    })
+
+    it('读墓碑抛错 ⇒ 当成「没有记录」，降级不抛错，仍然一个都不加', async () => {
+      const { deps } = site({ models: [{ id: 'a' }], catalog: ['a', 'b'], readThrows: true })
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual([])
+      expect(outcome.holdReason).toBeDefined()
+    })
+
+    it('没接线墓碑（readOffered 缺席）⇒ 同样走保守路径，不抛错', async () => {
+      const { deps } = site({ models: [{ id: 'a' }], catalog: ['a', 'b'] })
+      delete deps.readOffered
+      delete deps.writeOffered
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual([])
+      expect(outcome.holdReason).toBeDefined()
+    })
+
+    it('🔴 墓碑写回失败 ⇒ provider 写入的结果不受影响，只在 stateWarning 里注明', async () => {
+      const writes: string[][] = []
+      const { deps } = site({ models: [{ id: 'a' }], catalog: ['a', 'c'], offered: ['a'] })
+      deps.writeOffered = async (ids) => {
+        writes.push([...ids])
+        throw new Error('EROFS: read-only file system')
+      }
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.addedModels).toEqual(['c'])
+      expect(outcome.backupPath).toBeDefined()
+      expect(outcome.stateWarning).toContain('EROFS')
+      expect(outcome.stateWarning).toContain('不影响')
+      expect(writes).toEqual([['a', 'c']])
+    })
+
+    it('🔴 kept 的条目原样保留：用户调过的数值不会被网关的实测值覆盖', async () => {
+      const calls: Array<{ ops: unknown[] }> = []
+      const { deps } = site({
+        models: [{ id: 'a', contextWindow: 12345, maxTokens: 678, input: ['text'] }],
+        catalog: ['a', 'c'],
+        offered: ['a'],
+        onMutate: (_ns, ops) => { calls.push({ ops }) },
+      })
+      await seedEditableProvider(deps)
+      const models = (calls[0].ops[0] as { value: { models: unknown[] } }).value.models
+      expect(models[0]).toEqual({ id: 'a', contextWindow: 12345, maxTokens: 678, input: ['text'] })
+      expect(models).toHaveLength(2)
+    })
+
+    it('🔴 重建同样过安全网：写前备份 → 写 → 按「保留 + 新增」核对 → 不对就回滚（且不写墓碑）', async () => {
+      const order: string[] = []
+      const expectedCounts: number[] = []
+      const { deps, writes } = site({
+        models: [{ id: 'a' }, { id: 'b' }],
+        catalog: ['a', 'b', 'c'],
+        offered: ['a', 'b'],
+        onMutate: () => { order.push('mutate') },
+        guard: fakeGuard({
+          snapshot: async () => {
+            order.push('snapshot')
+            return { backupPath: 'bak', entryCount: 34, bytes: 1 }
+          },
+          verify: async (_baseline, expected) => {
+            expectedCounts.push(expected.modelCount)
+            return { ok: true }
+          },
+        }),
+      })
+      const outcome = await seedEditableProvider(deps)
+      expect(order).toEqual(['snapshot', 'mutate'])
+      expect(expectedCounts).toEqual([3])
+      expect(outcome.kind).toBe('rebuilt')
+      if (outcome.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(outcome.backupPath).toBe('bak')
+      expect(writes).toEqual([['a', 'b', 'c']])
+    })
+
+    it('🔴 重建判定不通过 ⇒ rolled-back，且绝不写墓碑', async () => {
       let rolledBack = 0
-      const outcome = await seedEditableProvider({
-        ...baseDeps,
-        ...siteExistingProvider(),
-        overwrite: true,
+      const { deps, writes } = site({
+        models: [{ id: 'a' }],
+        catalog: ['a', 'c'],
+        offered: ['a'],
         guard: fakeGuard({
           verify: async () => ({ ok: false, reasons: ['profile patch 条目数变少：写入前 34 → 写入后 3'] }),
           rollback: async () => { rolledBack += 1 },
         }),
       })
+      const outcome = await seedEditableProvider(deps)
       expect(outcome.kind).toBe('rolled-back')
       expect(rolledBack).toBe(1)
+      expect(writes).toEqual([])
     })
 
-    it('🔴 顺序：备份发生在写入之前（不是写完才想起来备份）', async () => {
-      const order: string[] = []
-      await seedEditableProvider({
+    it('重建时没接线安全网 ⇒ failed，一个字节都不写、也不写墓碑', async () => {
+      const { deps, writes } = site({ models: [{ id: 'a' }], catalog: ['a', 'c'], offered: ['a'] })
+      delete deps.guard
+      const outcome = await seedEditableProvider(deps)
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind !== 'failed') throw new Error('unreachable')
+      expect(outcome.detail).toContain('安全网')
+      // 手工块给的是**合并后**的清单（贴回去等价于「只增不删」，不是整份覆盖）
+      expect(outcome.manualBlock).toContain('c')
+      expect(writes).toEqual([])
+    })
+
+    it('overwrite=true 但 provider 本来缺失 → created（不是 rebuilt），并把全部 id 记为提供过', async () => {
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
         ...baseDeps,
-        ...siteExistingProvider(() => { order.push('mutate') }),
+        settings: fakeSettings([{ ns: 'llm-pi-ai', revision: 1, schema: providersForm(), value: { providers: {} } }]),
+        fetchEntries: async () => [
+          entry('a', { contextLength: 1, maxOutputTokens: 1 }),
+          entry('b', { contextLength: 1, maxOutputTokens: 1 }),
+        ],
         overwrite: true,
-        guard: fakeGuard({
-          snapshot: async () => {
-            order.push('snapshot')
-            return { backupPath: 'b', entryCount: 34, bytes: 1 }
-          },
-        }),
+        guard: fakeGuard(),
+        writeOffered: async (ids) => { writes.push([...ids]) },
       })
-      expect(order).toEqual(['snapshot', 'mutate'])
+      expect(outcome.kind).toBe('created')
+      if (outcome.kind !== 'created') throw new Error('unreachable')
+      expect(outcome.offeredModels).toEqual(['a', 'b'])
+      expect(writes).toEqual([['a', 'b']])
+    })
+  })
+
+  describe('墓碑写回时机（严格：failed / rolled-back / skipped 绝不写）', () => {
+    const existing = (models: unknown[] = [{ id: 'a' }]) => fakeSettings([{
+      ns: 'llm-pi-ai',
+      revision: 3,
+      schema: providersForm(),
+      value: { providers: { workbuddy: { models } } },
+    }])
+
+    it('present ⇒ 写「上一轮墓碑 ∪ 当前配置里的 id」（删掉过的 id 不能被抹掉）', async () => {
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: existing([{ id: 'a' }]),
+        fetchEntries: async () => { throw new Error('present 不该拉目录') },
+        readOffered: async () => ['a', 'b'],
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(outcome).toMatchObject({ kind: 'present', ns: 'llm-pi-ai', modelCount: 1 })
+      if (outcome.kind !== 'present') throw new Error('unreachable')
+      expect(outcome.offeredModels).toEqual(['a', 'b'])
+      expect(outcome.offeredRecorded).toBe(true)
+      expect(writes).toEqual([['a', 'b']])
+    })
+
+    it('🔴 present 且没有旧记录 ⇒ **不写**任何记录（不拿当前配置去造基线）', async () => {
+      // 拿"用户留着的"当"我们提供过的"，下一次 --rebuild 就会把他删掉的模型全加回来。
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: existing([{ id: 'a' }, { id: 'b' }]),
+        fetchEntries: async () => { throw new Error('present 不该拉目录') },
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      if (outcome.kind !== 'present') throw new Error('unreachable')
+      expect(outcome.offeredRecorded).toBe(false)
+      expect(outcome.offeredModels).toEqual(['a', 'b'])
+      expect(writes).toEqual([])
+    })
+
+    it('🔴 升级路径：老 provider 先 present（不造记录）⇒ 第一次 --rebuild 一个都不加', async () => {
+      // 用户在这个版本之前就删掉过模型：插件手上没有任何"提供过"的记录，
+      // 于是第一次 --rebuild 必须保守 —— 加错就是复活他删掉的模型。
+      let stored: string[] | undefined
+      const first = await seedEditableProvider({
+        ...baseDeps,
+        settings: existing([{ id: 'a' }]),
+        fetchEntries: async () => { throw new Error('present 不该拉目录') },
+        readOffered: async () => stored,
+        writeOffered: async (ids) => { stored = [...ids] },
+      })
+      expect(first.kind).toBe('present')
+      expect(stored).toBeUndefined()
+
+      const writes: string[][] = []
+      const second = await seedEditableProvider({
+        ...baseDeps,
+        overwrite: true,
+        settings: existing([{ id: 'a' }]),
+        fetchEntries: async () => [entry('a', { contextLength: 1, maxOutputTokens: 1 }), entry('b', { contextLength: 1, maxOutputTokens: 1 })],
+        readOffered: async () => stored,
+        writeOffered: async (ids) => { writes.push([...ids]); stored = [...ids] },
+      })
+      expect(second.kind).toBe('rebuilt')
+      if (second.kind !== 'rebuilt') throw new Error('unreachable')
+      expect(second.addedModels).toEqual([])
+      expect(second.holdReason).toBeDefined()
+      // 基线立起来了：保留的 ∪ 网关目录；下一次刷新才会开始"只补新增"。
+      expect(writes).toEqual([['a', 'b']])
+    })
+
+    it('present 时墓碑写失败 ⇒ 结果仍是 present + stateWarning（配置没被写，所以也没得回滚）', async () => {
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: existing([{ id: 'a' }]),
+        fetchEntries: async () => { throw new Error('present 不该拉目录') },
+        readOffered: async () => ['a'],
+        writeOffered: async () => { throw new Error('EACCES') },
+      })
+      expect(outcome.kind).toBe('present')
+      if (outcome.kind !== 'present') throw new Error('unreachable')
+      expect(outcome.stateWarning).toContain('EACCES')
+    })
+
+    it('created ⇒ 写全部 id；写失败也只是 stateWarning，created 照样成立', async () => {
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: fakeSettings([{ ns: 'llm-pi-ai', revision: 1, schema: providersForm(), value: { providers: {} } }]),
+        fetchEntries: async () => [entry('a', { contextLength: 1, maxOutputTokens: 1 })],
+        guard: fakeGuard(),
+        writeOffered: async () => { throw new Error('ENOSPC') },
+      })
+      expect(outcome.kind).toBe('created')
+      if (outcome.kind !== 'created') throw new Error('unreachable')
+      expect(outcome.offeredModels).toEqual(['a'])
+      expect(outcome.stateWarning).toContain('ENOSPC')
+      expect(outcome.stateWarning).toContain('不影响')
+    })
+
+    it('created 的回滚分支 ⇒ 不写墓碑', async () => {
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: fakeSettings([{ ns: 'llm-pi-ai', revision: 1, schema: providersForm(), value: { providers: {} } }]),
+        fetchEntries: async () => [entry('a', { contextLength: 1, maxOutputTokens: 1 })],
+        guard: fakeGuard({ verify: async () => ({ ok: false, reasons: ['条目变少'] }) }),
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(outcome.kind).toBe('rolled-back')
+      expect(writes).toEqual([])
+    })
+
+    it('写入抛错 ⇒ failed，不写墓碑', async () => {
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        settings: fakeSettings(
+          [{ ns: 'llm-pi-ai', schema: providersForm(), value: { providers: {} } }],
+          () => { throw new Error('not volatile') },
+        ),
+        fetchEntries: async () => [entry('a', { contextLength: 1, maxOutputTokens: 1 })],
+        guard: fakeGuard(),
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(outcome.kind).toBe('failed')
+      expect(writes).toEqual([])
+    })
+
+    it('网关不可达 ⇒ failed，不写墓碑', async () => {
+      const writes: string[][] = []
+      const outcome = await seedEditableProvider({
+        ...baseDeps,
+        catalogAttempts: 1,
+        settings: fakeSettings([{ ns: 'llm-pi-ai', schema: providersForm(), value: { providers: {} } }]),
+        fetchEntries: async () => { throw new Error('ECONNREFUSED') },
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(outcome.kind).toBe('failed')
+      expect(writes).toEqual([])
+    })
+
+    it('skipped（没有 settings / 没有 namespace）⇒ 不写墓碑', async () => {
+      const writes: string[][] = []
+      const noSettings = await seedEditableProvider({
+        ...baseDeps,
+        settings: undefined,
+        fetchEntries: async () => [],
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(noSettings.kind).toBe('skipped')
+      const noNamespace = await seedEditableProvider({
+        ...baseDeps,
+        namespaceAttempts: 1,
+        settings: fakeSettings([{ ns: 'ui-theme', schema: { type: 'object', dict: {} }, value: {} }]),
+        fetchEntries: async () => [],
+        writeOffered: async (ids) => { writes.push([...ids]) },
+      })
+      expect(noNamespace.kind).toBe('skipped')
+      expect(writes).toEqual([])
     })
   })
 })
