@@ -13,7 +13,9 @@ import {
   diffProviderModels,
   findProviderNamespace,
   GATEWAY_WIRE_API,
+  probeNamespaceCandidates,
   providerExists,
+  renderNamespaceProbe,
   renderProviderNotes,
   renderProviderProfileYaml,
   seedEditableProvider,
@@ -128,6 +130,170 @@ describe('findProviderNamespace', () => {
     ]), '')
     expect(found).toBeDefined()
     expect(Object.keys(found?.providers ?? {}).sort()).toEqual(['handwritten', 'inherited', 'live'])
+  })
+})
+
+describe('probeNamespaceCandidates / renderNamespaceProbe（把"没找到"变成可诊断）', () => {
+  it('describe 返回空 → 空数组；渲染文本点明「0 个条目」并给出可能的解释', () => {
+    expect(probeNamespaceCandidates(fakeSettings([]))).toEqual([])
+    const text = renderNamespaceProbe([])
+    expect(text).toContain('0 个条目')
+    expect(text).toContain('已激活')
+  })
+
+  it('settings 缺失 / 没有 describe / describe 抛错 → 空数组，都不抛', () => {
+    expect(probeNamespaceCandidates(undefined)).toEqual([])
+    expect(probeNamespaceCandidates({})).toEqual([])
+    expect(probeNamespaceCandidates({ describe: () => { throw new Error('boom') } })).toEqual([])
+  })
+
+  it('🔴 逐条报出 schema 形状 —— 这几种故障当初长得一模一样，分不清', () => {
+    const probes = probeNamespaceCandidates(fakeSettings([
+      { ns: 'llm-pi-ai', schema: providersForm(), value: {} },
+      { ns: 'ui-theme', schema: { type: 'object', dict: { accent: { type: 'string' } } }, value: {} },
+      { ns: 'weird', schema: { type: 'object', dict: { providers: { type: 'array' } } }, value: {} },
+      { ns: 'bare', value: {} },
+    ]))
+    // schemaPreview 是给人看的 JSON，不参与结构断言。
+    expect(probes.map(({ ns, hasSchema, schemaType, dictKeys, providersType, matched }) =>
+      ({ ns, hasSchema, schemaType, dictKeys, providersType, matched }))).toEqual([
+      { ns: 'llm-pi-ai', hasSchema: true, schemaType: 'object', dictKeys: ['providers'], providersType: 'dict', matched: true },
+      { ns: 'ui-theme', hasSchema: true, schemaType: 'object', dictKeys: ['accent'], providersType: undefined, matched: false },
+      { ns: 'weird', hasSchema: true, schemaType: 'object', dictKeys: ['providers'], providersType: 'array', matched: false },
+      { ns: 'bare', hasSchema: false, schemaType: undefined, dictKeys: [], providersType: undefined, matched: false },
+    ])
+
+    const text = renderNamespaceProbe(probes)
+    expect(text).toContain('返回了 4 个条目')
+    expect(text).toContain('✅ llm-pi-ai')
+    // 三种不同的"没匹配上"必须能被区分开。
+    expect(text).toContain('describe() 里没有 schema 字段')       // bare：字段根本没有
+    expect(text).toContain('dict 键=[accent]')                    // ui-theme：有 dict 但没 providers
+    expect(text).toContain('providers.type=array')                // weird：有 providers 但类型不对
+  })
+
+  it('🔴 形状对不上时把 schema 的 JSON 摘要打出来（那才是最难的故障）', () => {
+    const probes = probeNamespaceCandidates(fakeSettings([
+      { ns: 'llm-pi-ai', schema: { type: 'object', dict: { providers: { type: 'list' } } }, value: {} },
+    ]))
+    expect(probes[0].schemaPreview).toContain('"providers"')
+    expect(renderNamespaceProbe(probes)).toContain('↳')
+  })
+
+  it('没有 schema 的条目不打 JSON 摘要（20 多条时不至于把输出淹掉）', () => {
+    const probes = probeNamespaceCandidates(fakeSettings([{ ns: 'bare', value: {} }]))
+    const text = renderNamespaceProbe(probes)
+    expect(text).toContain('describe() 里没有 schema 字段')
+    expect(text).not.toContain('↳')
+  })
+
+  it('schema 无法 JSON 化时不抛错', () => {
+    const cyclic: Record<string, unknown> = { type: 'object', dict: {} }
+    cyclic.self = cyclic
+    const probes = probeNamespaceCandidates(fakeSettings([{ ns: 'cyclic', schema: cyclic, value: {} }]))
+    expect(probes[0].schemaPreview).toBe('(无法 JSON 化)')
+    expect(probes[0].hasSchema).toBe(true)
+  })
+
+  it('🔴 no-namespace 的 detail 里带上实际探测结果（不再只说"没找到"）', async () => {
+    const outcome = await seedEditableProvider({
+      providerName: 'workbuddy',
+      preferredNamespace: '',
+      apiKeyEnv: 'WORKBUDDY2API_API_KEY',
+      baseURL: 'http://127.0.0.1:7863/v1',
+      sleep: async () => {},
+      namespaceAttempts: 1,
+      settings: fakeSettings([{ ns: 'ui-theme', schema: { type: 'object', dict: {} }, value: {} }]),
+      fetchEntries: async () => [],
+    })
+    expect(outcome.kind).toBe('skipped')
+    if (outcome.kind !== 'skipped') throw new Error('unreachable')
+    expect(outcome.detail).toContain('ui-theme')
+    expect(outcome.detail).toContain('返回了 1 个条目')
+  })
+
+  describe('🔴 引用表形态 {uid, refs} —— 真机上的实际形状（2026-10-14 之前完全没被识别）', () => {
+    /** 造一个 schemastery 引用表；`providers` 处可放数字 id、数字字符串或内联节点。 */
+    function refTable(providers: unknown): Record<string, unknown> {
+      return {
+        uid: 100,
+        refs: {
+          100: { type: 'object', meta: { default: {} }, dict: { providers } },
+          200: { type: 'dict', meta: {}, inner: 201 },
+          201: { type: 'object', meta: {}, dict: {} },
+        },
+      }
+    }
+
+    const probeOne = (schema: unknown) =>
+      probeNamespaceCandidates(fakeSettings([{ ns: 'llm-pi-ai', schema, value: {} }]))[0]
+
+    it('providers 用数字 id 引用到 dict 节点 → 识别', () => {
+      expect(probeOne(refTable(200))).toMatchObject({
+        form: 'refs', schemaType: 'object', dictKeys: ['providers'], providersType: 'dict', matched: true,
+      })
+    })
+
+    it('providers 用数字字符串引用 → 也识别', () => {
+      expect(probeOne(refTable('200')).matched).toBe(true)
+    })
+
+    it('providers 直接内联在 dict 里 → 也识别', () => {
+      expect(probeOne(refTable({ type: 'dict', meta: {} })).matched).toBe(true)
+    })
+
+    it('providers 指向的节点不是 dict → 不识别，但类型要如实报出来', () => {
+      const table = {
+        uid: 100,
+        refs: { 100: { type: 'object', dict: { providers: 200 } }, 200: { type: 'list', meta: {} } },
+      }
+      expect(probeOne(table)).toMatchObject({ form: 'refs', providersType: 'list', matched: false })
+    })
+
+    it('根节点不是 object → 不识别', () => {
+      expect(probeOne({ uid: 100, refs: { 100: { type: 'string', dict: {} } } }).matched).toBe(false)
+    })
+
+    it('providers 指向不存在的 id → 不识别，也不抛错', () => {
+      expect(probeOne(refTable(999))).toMatchObject({ form: 'refs', providersType: undefined, matched: false })
+    })
+
+    it('自引用成环不会挂死', () => {
+      const refs: Record<string, unknown> = { 100: { type: 'object', dict: { providers: 101 } } }
+      refs[101] = refs[100]
+      expect(probeOne({ uid: 100, refs }).matched).toBe(false)
+    })
+
+    it('渲染时标出形态是 refs', () => {
+      const text = renderNamespaceProbe([probeOne(refTable(200))])
+      expect(text).toContain('✅ llm-pi-ai')
+      expect(text).toContain('形态=refs')
+    })
+
+    it('🔴 端到端：引用表形态下 seedEditableProvider 必须能探测到 namespace 并写入', async () => {
+      const calls: Array<{ ns: string; ops: unknown[]; rev?: number }> = []
+      const outcome = await seedEditableProvider({
+        providerName: 'workbuddy',
+        preferredNamespace: '',
+        apiKeyEnv: 'WORKBUDDY2API_API_KEY',
+        baseURL: 'http://127.0.0.1:7863/v1',
+        sleep: async () => {},
+        namespaceAttempts: 1,
+        settings: fakeSettings(
+          [{ ns: 'llm-pi-ai', revision: 3, schema: refTable(200), value: { providers: { other: {} } } }],
+          (ns, ops, rev) => { calls.push({ ns, ops, rev }) },
+        ),
+        fetchEntries: async () => [entry('cn:x', { contextLength: 100, maxOutputTokens: 10 })],
+        guard: fakeGuard(),
+      })
+      expect(outcome.kind).toBe('created')
+      expect(calls.length).toBe(1)
+      expect(calls[0].ns).toBe('llm-pi-ai')
+    })
+
+    it('🔴 内联形态仍然照旧可用（不能为了修 refs 而弄坏原有的）', () => {
+      expect(probeOne(providersForm())).toMatchObject({ form: 'inline', providersType: 'dict', matched: true })
+    })
   })
 })
 

@@ -356,11 +356,229 @@ const DEFAULT_CATALOG_INTERVAL_MS = 1500
  */
 const PASTE_INDENT = 6
 
-/** 是否是根级 `providers` 为 dict 的 volatile 表单。 */
+/**
+ * 解开 schemastery 的**引用表**序列化。
+ *
+ * `dsh-settings.describe()` 交出来的 `schema` **不是内联 JSON**，而是 schemastery
+ * `toJSON()` 的引用表形态：
+ *
+ * ```json
+ * { "uid": 30940,
+ *   "refs": { "30797": { "type": "number", ... },
+ *             "30940": { "type": "object", "dict": { "providers": 30798 } } } }
+ * ```
+ *
+ * —— 节点之间用**数字 id** 互相引用：`dict` 的值可能是一个内联节点，也可能是一个 id。
+ * 所以要判断"根级 providers 是不是 dict"，必须**先解引用**。
+ *
+ * ★ 2026-10-14 实测踩到的坑：本模块原先只认内联形态
+ * `{type:'object', dict:{providers:{type:'dict'}}}`，于是**永远匹配不上** ——
+ * 结果是插件在真机上一直走 `skipped: no-namespace`，**0.4.0 的核心功能
+ * （把模型目录写成可编辑 provider）从未生效过一次**。而当时插件的日志用
+ * `ctx.logger`、在 host 日志里完全不可见，于是"什么都没发生"被误读成了
+ * "走了 `present` 空操作分支"。
+ *
+ * @param refs - 引用表（`schema.refs`）。
+ * @param node - 待解引用的节点（可能是内联对象、数字 id 或数字字符串）。
+ * @returns 解引用后的节点；解不到时 undefined。
+ */
+function deref(refs: Record<string, unknown>, node: unknown): Record<string, unknown> | undefined {
+  let current: unknown = node
+  // 上限只是防环，正常情况下 1~2 跳就到底。
+  for (let hop = 0; hop < 32; hop += 1) {
+    if (typeof current === 'number') {
+      current = refs[String(current)]
+      continue
+    }
+    if (typeof current === 'string' && /^\d+$/.test(current)) {
+      current = refs[current]
+      continue
+    }
+    break
+  }
+  return typeof current === 'object' && current !== null && !Array.isArray(current)
+    ? (current as Record<string, unknown>)
+    : undefined
+}
+
+/** 取一个节点的 `dict.<key>`（不解引用返回值）。 */
+function dictField(node: Record<string, unknown> | undefined, key: string): unknown {
+  const dict = node?.dict
+  if (typeof dict !== 'object' || dict === null) return undefined
+  return (dict as Record<string, unknown>)[key]
+}
+
+/** 从任意 `describe().schema` 里读出的形状信息（判定与诊断共用，避免两处漂移）。 */
+interface ProvidersShape {
+  /** 序列化形态：`inline`（内联）/ `refs`（引用表）/ `none`（不是对象）。 */
+  form: 'none' | 'inline' | 'refs'
+  /** 根节点的 `type`。 */
+  rootType: string | undefined
+  /** 根节点的键清单。 */
+  rootKeys: string[]
+  /** 根节点 `dict` 的键清单。 */
+  dictKeys: string[]
+  /** 根级 `providers` **解引用后**的 `type`。 */
+  providersType: string | undefined
+}
+
+/**
+ * 把 `describe().schema` 归一成 {@link ProvidersShape}。
+ *
+ * **两种形态都认**（见 {@link deref}）：
+ *   · 内联：`{type:'object', dict:{providers:{type:'dict'}}}`
+ *   · 引用表：`{uid, refs:{...}}` —— 这才是现在真机上的实际形状。
+ *
+ * @param schema - `descriptor.schema`。
+ * @returns 形状信息；不是对象时 `form` 为 `none`。
+ */
+function readProvidersShape(schema: unknown): ProvidersShape {
+  if (typeof schema !== 'object' || schema === null) {
+    return { form: 'none', rootType: undefined, rootKeys: [], dictKeys: [], providersType: undefined }
+  }
+  const node = schema as Record<string, unknown>
+  const refsRaw = node.refs
+  const isRefTable = typeof refsRaw === 'object' && refsRaw !== null
+    && (typeof node.uid === 'number' || (typeof node.uid === 'string' && /^\d+$/.test(node.uid)))
+  const table = isRefTable ? (refsRaw as Record<string, unknown>) : {}
+  const root = isRefTable ? deref(table, node.uid) : node
+  const providersNode = deref(table, dictField(root, 'providers'))
+  const dict = root?.dict
+  return {
+    form: isRefTable ? 'refs' : 'inline',
+    rootType: asString(root?.type),
+    rootKeys: root === undefined ? [] : Object.keys(root),
+    dictKeys: typeof dict === 'object' && dict !== null ? Object.keys(dict) : [],
+    providersType: asString(providersNode?.type),
+  }
+}
+
+/**
+ * 是否是根级 `providers` 为 dict 的 volatile 表单。
+ *
+ * 判定完全交给 {@link readProvidersShape}，所以内联与引用表两种形态**一视同仁**。
+ *
+ * @param schema - `descriptor.schema`。
+ * @returns 是否可作为 provider 的落点。
+ */
 function isProvidersForm(schema: unknown): boolean {
-  if (typeof schema !== 'object' || schema === null) return false
-  const node = schema as { type?: unknown; dict?: Record<string, { type?: unknown } | undefined> }
-  return node.type === 'object' && node.dict?.providers?.type === 'dict'
+  const shape = readProvidersShape(schema)
+  return shape.form !== 'none' && shape.rootType === 'object' && shape.providersType === 'dict'
+}
+
+/** 一条 settings 条目的探测结果（诊断用）。 */
+export interface NamespaceCandidateProbe {
+  /** profile 条目 id。 */
+  ns: string
+  /** `descriptor.schema` 这个字段有没有值。 */
+  hasSchema: boolean
+  /** 序列化形态：`inline`（内联）/ `refs`（引用表）/ `none`。 */
+  form: 'none' | 'inline' | 'refs'
+  /** 根节点的 `type`。 */
+  schemaType: string | undefined
+  /** 根节点的键清单。 */
+  schemaKeys: string[]
+  /** 根节点 `dict` 的键清单；没有 dict 就是空数组。 */
+  dictKeys: string[]
+  /** 根级 `providers` **解引用后**的 `type`。 */
+  providersType: string | undefined
+  /** schema 的 JSON 摘要（截断），用于肉眼核对真实形状。 */
+  schemaPreview: string
+  /** 是否被判定为「providers 表单」。 */
+  matched: boolean
+}
+
+/** 诊断里 schema JSON 摘要的截断长度。 */
+const SCHEMA_PREVIEW_LIMIT = 220
+
+/** 只在值确实是字符串时才返回它（诊断要的是"原样"，不是"猜"。） */
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * 把 `settings.describe()` 的**实际返回**摊开成诊断列表。
+ *
+ * ## 为什么需要它
+ *
+ * `no-namespace` 这条分支原先只说"没有「根级 providers 是 dict」的条目"，
+ * 却**不说到底探测到了什么**。于是下面这些完全不同的故障，从输出上无法区分：
+ *   · `describe()` 返回空 —— 条目还没激活，或 settings 是残的；
+ *   · 有条目但确实没有 `schema` 字段；
+ *   · 有 `schema` 但**形态不一样**（内联 vs 引用表 —— 见 {@link deref}）；
+ *   · 有 `providers` 但类型不是 `dict`。
+ *
+ * ★ 2026-10-14：正是加上这个诊断之后，才看清 `describe()` 交出来的是
+ *   `{uid, refs}` 引用表、而不是内联 JSON —— 于是找到了"插件从未生效"的真因。
+ *   在此之前只能靠猜，且猜错了（误判成"走了 present 分支"）。
+ *
+ * @param settings - settings 服务。
+ * @returns 每条目的探测结果；`describe` 缺失或抛错时返回空数组。
+ */
+export function probeNamespaceCandidates(
+  settings: SettingsServiceLike | undefined,
+): NamespaceCandidateProbe[] {
+  if (settings?.describe === undefined) return []
+  let descriptors: SettingsDescriptor[]
+  try {
+    descriptors = settings.describe({ redactSecrets: true }) ?? []
+  } catch {
+    return []
+  }
+  return descriptors.map((descriptor) => {
+    const raw: unknown = descriptor.schema
+    const shape = readProvidersShape(raw)
+    let schemaPreview = '(schema 字段不存在)'
+    if (raw !== undefined) {
+      try {
+        const text = JSON.stringify(raw) ?? String(raw)
+        schemaPreview = text.length > SCHEMA_PREVIEW_LIMIT ? `${text.slice(0, SCHEMA_PREVIEW_LIMIT)}…` : text
+      } catch {
+        schemaPreview = '(无法 JSON 化)'
+      }
+    }
+    return {
+      ns: descriptor.ns,
+      hasSchema: raw !== undefined,
+      form: shape.form,
+      schemaType: shape.rootType,
+      schemaKeys: shape.rootKeys,
+      dictKeys: shape.dictKeys,
+      providersType: shape.providersType,
+      schemaPreview,
+      matched: isProvidersForm(raw),
+    }
+  })
+}
+
+/**
+ * 把 {@link probeNamespaceCandidates} 的结果渲染成可读的多行诊断。
+ *
+ * 有 schema 的条目会额外打一行 JSON 摘要 —— 因为"形态不对"才是最难猜的那种故障；
+ * 没有 schema 的条目只报一行，避免 20 多条把输出淹掉。
+ *
+ * @param probes - 探测结果。
+ * @returns 诊断文本（首行是总数，随后逐条列出）。
+ */
+export function renderNamespaceProbe(probes: NamespaceCandidateProbe[]): string {
+  if (probes.length === 0) {
+    return 'settings.describe() 返回了 0 个条目 —— 此刻没有任何条目已激活。'
+      + '注意 settings namespace 就是 profile 条目 id，只有已激活的条目才会出现在 describe() 里；'
+      + '若刚刚启动，可能是 Loader 还没把条目挂上（本插件已按 namespaceAttempts 重试过）。'
+  }
+  const lines = probes.flatMap((probe) => {
+    if (probe.matched) {
+      return [`  ✅ ${probe.ns}：形态=${probe.form} · 根 type=object · providers.type=dict（可用）`]
+    }
+    if (!probe.hasSchema) return [`  · ${probe.ns}：describe() 里没有 schema 字段`]
+    const shape = `  · ${probe.ns}：形态=${probe.form}`
+      + ` · 根 type=${probe.schemaType ?? '(无)'}`
+      + ` · 根键=[${probe.schemaKeys.join(', ')}]`
+      + ` · dict 键=[${probe.dictKeys.join(', ')}]`
+      + (probe.providersType === undefined ? '' : ` · providers.type=${probe.providersType}`)
+    return [shape, `      ↳ ${probe.schemaPreview}`]
+  })
+  return `settings.describe() 返回了 ${probes.length} 个条目：\n${lines.join('\n')}`
 }
 
 /** 安全地取一个值里的 `providers` 字典。 */
@@ -684,7 +902,10 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
       kind: 'skipped',
       reason: 'no-namespace',
       detail: 'settings.describe() 里没有任何「根级 providers 是 dict」的条目'
-        + `${deps.preferredNamespace.length > 0 ? `（已指定 providerNamespace=${deps.preferredNamespace}）` : ''}`,
+        + `${deps.preferredNamespace.length > 0 ? `（已指定 providerNamespace=${deps.preferredNamespace}）` : ''}`
+        // 把**实际探测到什么**一并报出来。只报"没找到"会让几种完全不同的故障
+        // 长得一模一样 —— 2026-10-14 就是被这一点卡住的（见 probeNamespaceCandidates）。
+        + `\n${renderNamespaceProbe(probeNamespaceCandidates(settings))}`,
     }
   }
   const existing = namespace.providers[deps.providerName]
