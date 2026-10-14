@@ -47,6 +47,9 @@ const E2E_CONFIG = 'vitest.e2e.config.ts'
 const SPEC_LOCAL = 'tests/e2e/write-guard-fs.spec.ts' // 纯本地文件系统，默认跑
 const CLI_TOOL = 'tools/wb2api.mjs' // 独立 CLI（不经 dsh 插件）
 const SPEC_CLI = 'tests/e2e/cli-offline.spec.ts' // 上面那个 CLI 的离线契约
+const CLIENT_CHECK = 'tools/client-bundle-check.mjs' // 浏览器半边（设置卡片）的离线闸门
+/** 上面那支闸门的自我启动入口：node 直接跑它，它再跑闸门（见行尾注释）。 */
+const CLIENT_LAUNCH = 'tools/client-bundle-check.run.mjs'
 const SPEC_LIVE = 'tests/e2e/live-gateway.spec.ts' // 打真网关 + 真实对话，默认不跑
 const DEFAULT_TIMEOUT_MS = 180_000
 const NETWORK_TIMEOUT_MS = 600_000 // live spec 自己的 testTimeout 是 300s，别在这里先把它掐死
@@ -69,6 +72,25 @@ const CLI_SKIP =
     : !existsSync(join(ROOT, SPEC_CLI)) ? `${SPEC_CLI} 不存在`
       : undefined
 
+/**
+ * 浏览器半边那条的 SKIP 原因（`undefined` = 该跑）。
+ *
+ * 这条套件是**一支独立脚本**（不是 vitest 用例），它的入口是 `CLIENT_LAUNCH`：
+ * 一个仓库内的真实文件，自己 import 并执行真正的闸门 `CLIENT_CHECK`，然后把闸门的
+ * 退出码原样传出去。这样做是为了让本表的 `existsSync(join(ROOT, entry))` 判定成立 ——
+ * 本表不认 `node_modules` 之外的绝对入口（`join(ROOT, "D:\\...\\node.exe")` 在 Windows
+ * 上会把盘符当普通目录名拼起来，于是"入口不存在"会假报成"依赖没装"）。
+ * 闸门脚本被删/改名时，这里显式记 SKIP —— 见文件头规矩①。
+ *
+ * 额外认一个哨兵：闸门自己也没法预知自己会不会被删，万一它在运行期发现
+ * `lib/client.js` 不在，会以退出码 2 结束（stdout 里带 SKIP）；这一行把那个 2 翻译成
+ * 同样的 SKIP，而不是 FAIL —— 缺文件是"没跑"，不是"跑挂了"。
+ */
+const CLIENT_SKIP =
+  !existsSync(join(ROOT, CLIENT_CHECK)) ? `${CLIENT_CHECK} 不存在（浏览器半边未提供？）`
+    : !existsSync(join(ROOT, CLIENT_LAUNCH)) ? `${CLIENT_LAUNCH} 不存在（入口缺了）`
+      : undefined
+
 /** [标签, 入口(相对 ROOT), 参数, { skip?, timeoutMs? }?] */
 const SUITES = [
   ['typecheck (tsc --noEmit)', TSC, ['-p', 'tsconfig.json', '--noEmit']],
@@ -84,6 +106,16 @@ const SUITES = [
     VITEST,
     ['run', '--config', E2E_CONFIG, SPEC_CLI],
     { skip: CLI_SKIP },
+  ],
+  // 浏览器半边（设置卡片 lib/client.js）的离线闸门：不用浏览器就能证明它是经典脚本、
+  // id 严格等于包名、两个席位/四个 key、双前缀只在"不是 JSON"时才换、四种状态都能渲染、
+  // 且签到/重建清单/测试模型三个按钮都只在点了之后才发请求。
+  // 入口见上面 CLIENT_SKIP 的说明。
+  [
+    'client bundle 离线闸门 (lib/client.js 加载契约 + 双前缀 + 四状态)',
+    CLIENT_LAUNCH,
+    [],
+    { skip: CLIENT_SKIP },
   ],
   ['build (tsc -p tsconfig.json → lib/)', TSC, ['-p', 'tsconfig.json']],
   // 联网组：只有 --network 才进表（不进表 = 这条本就不在本次范围内，表尾会说明）
@@ -146,6 +178,12 @@ for (const [label, entry, args = [], options = {}] of SUITES) {
     windowsHide: true,
   })
   const elapsed = clock(Date.now() - started)
+  // 退出码 2 = 套件自己说"我没跑"（见 CLIENT_SKIP 的第二段说明）：缺入口是 SKIP，不是 FAIL。
+  if (run.status === 2) {
+    results.push({ label, status: 'SKIP', detail: '套件自报未运行（缺入口）' })
+    console.log(`SKIP  ${label}  (套件自报未运行（缺入口）)`)
+    continue
+  }
   const ok = run.status === 0 // 只看退出码；status 为 null（超时/起不来）自然算 FAIL
   const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
   const source = output.trim() === '' && run.error !== undefined ? run.error.message : output

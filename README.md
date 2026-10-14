@@ -330,6 +330,44 @@ dsh 起来之后，在对话里执行：
 
 ---
 
+## 设置卡片的后端（宿主路由）
+
+设置页里那张插件卡片跑在**浏览器**里，而网关要 `Authorization: Bearer <api_key>`、还是跨源回环端点 —— 把 api_key 交给页面等于把它交给页面上任何脚本。所以卡片**不直连网关**，它跟宿主说话，宿主跟网关说话。这一半由 `src/api.ts` 实现，端点在**宿主 web 路由**上（不是 RPC 通道）：
+
+| 端点 | 作用 |
+|---|---|
+| `GET <prefix>/panel` | 一次性返回卡片要的全部数据（**只读**，只发 GET） |
+| `POST <prefix>/action` | `{ action: "rebuild" \| "checkin" \| "test" }` |
+
+**两条前缀都挂**：`/wb2api` 与 `/api/wb2api`（`/api` 是框架自己的 API 前缀，桌面 app 的界面层**只把 `/api/*` 转给宿主**，裸路径会被那一层挡掉）。`webServer` 最长前缀优先，两条不会互相抢。重复注册同一个 `(kind, path)` 会抛错，所以注册配了 `ctx.effect` 反注册 —— `ctx.inject` 的回调会重跑（连接/热重载），不反注册第二次就挂不上。
+
+**鉴权不自己发明**：用宿主自己的栅栏 `connection.requestRejection`（Host/Origin + 浏览器会话）。两条实测要点：
+
+- **必须连 `connection` 一起 `ctx.inject`** —— 只 inject `webServer` 拿不到栅栏；拿不到栅栏时插件**不注册**（「没有路由」优于「没有栅栏的路由」）。
+- **必须以方法形式调用**（`connection.requestRejection(req)`）：cordis 的服务是 Proxy，把方法摘成裸函数再调会让 `this` 落到一个没有 `browserAuth` 的影子上并抛错，于是栅栏永远 403、浏览器会话那一半根本没跑（实测：摘下来时"无 cookie"也返回 200）。
+- 唯一的放宽是**回环端口跳转**（Host 与 Origin 两边都是回环、端口可不同）——桌面 app 代理转发时就是这个形状，与兄弟插件同一口径。**401 永不放宽**，非回环 Host/Origin 也永不放宽。
+
+`panel` 的响应形状（拿不到的字段给 `null`，整块拿不到给 `null` + `ok:false` + `detail`，**不假装有数据**）：
+
+```json
+{ "ok": true,
+  "gateway":  { "reachable": true, "origin": "http://127.0.0.1:7863", "healthy": 1, "total": 1 },
+  "credits":  { "total": 3046, "accounts": [ { "uid": "…", "nickname": "186****5617", "realm": "cn",
+                                              "credits": 3046, "cooling": false, "disabled": false } ] },
+  "models":   { "gatewayTotal": 48, "unknownPrice": 12, "providerModelCount": 46 },
+  "provider": { "exists": true, "ns": "llm-pi-ai", "lastOffered": 48 },
+  "usage":    { "enabled": true, "since": "…", "requests": 0, "credit": 0, "uptimeSec": 2793, "models": [] },
+  "checkin":  { "supported": true, "note": "…" } }
+```
+
+`credits.accounts[].nickname` **必定已脱敏**（`src/nickname.ts`：`/status.nickname` 在本 build 实测就是手机号）。`action` 的三种回执：`rebuild` 给 `addedModels/keptModels/offeredModels`（均为**数字**）+ `addedModelIds`（具体 id，另有 `added/addedCount/keptCount/modelCount` 兼容别名）；`checkin` 给 `{ok, attempted, detail}`；`test` 给 `{ok, attempted, model, ms, creditSpent, results[], detail}`。
+
+**签到只做「用户点一次」**：`action:"checkin"` 由插件**直连上游**（`www.codebuddy.cn/v2/billing/meter/daily-checkin`，仅 CN）完成，**不经网关**。插件里**没有任何自动签到路径**（没有定时器、没有启动钩子），`panel.checkin.supported` 只有在存在启用的 CN 账号时才为真。理由见 [合规声明](#合规声明)：官方明文禁止「利用脚本、外挂、插件、模拟器、**接口调用**……刷取活跃或奖励」。
+
+**唯一会花额度的动作是 `test`**，它必须带 `confirm: true`（缺了它一个请求都不发）；没指定模型时只用 `credits === "x0.00"` 的免费档，一个都没有就**拒绝**而不替你挑一个收费的；调用前后各读一次 `/v1/stats`，回报**实测**花费差值。
+
+---
+
 ## 已知限制
 
 - **窗口/输出上限是「上游实际值 + 本地估计」的混合。** 网关对 `context_length` 走四级查找链：上游动态值权威 → 静态种子表 → `model.json` 缓存 → models.dev 按需拉取；**全未命中时兜底 1M**。因此冷门模型的窗口可能是兜底值而非真实值。`max_output_tokens` 同理，未收录时网关**不下发该键**，此时插件不声明 `defaultMaxTokens`，由网关自行决定。
@@ -460,7 +498,8 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 | `src/gateway-supervisor.ts` | 子进程托管：探测、spawn、探活、重启、回收 |
 | `src/accounts.ts` | 账号开关：扫描 `auths/` 凭证文件、按切换目标重命名（停/启网关的编排在 `index.ts`） |
 | `src/gateway-binary.ts` | 预编译二进制的下载、SHA256 校验、运行目录（`config.json`）准备 |
-| `src/login.ts` | 用 Node 复刻上游 OAuth 登录（取授权链接 → 轮询 token → 落盘凭证） |
+| `src/login.ts` | 用 Node 复刻上游 OAuth 登录（取授权链接 → 轮询 token → 落盘凭证）；`requestDailyCheckin()` 是**唯一**的签到实现（登录流程与设置卡片共用它） |
+| `src/api.ts` | 设置卡片的后端半边：`<prefix>/panel` 与 `<prefix>/action` 的**数据组装**（与传输无关，可离线测）+ 宿主路由的**注册/反注册/双前缀/栅栏**（见[设置卡片的后端](#设置卡片的后端宿主路由)） |
 | `src/setup.ts` | `/wb2api-setup` 的编排与逐步骤汇报 |
 | `src/nickname.ts` | 昵称脱敏：`/status.nickname` 在本 build 实测就是手机号，只在**看起来像手机号**时打码成 `186****5617`，其余原样（一律打码会让账号列表失去可辨识性）；`index.ts` 与 `setup.ts` 共用这一份 |
 | `src/boot-trace.ts` | 插件自己的启动轨迹：`<dsh home>/.wb2api/boot.log` 追加写一行一个锚点（`apply` / `settings` / 凭据 / 目录 / 服务 / 墓碑 / `seed`），失败全吞 —— 宿主日志看不见时才靠它区分「没加载」与「加载了但某步没跑」 |
@@ -492,6 +531,8 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 - **生成的配置只监听 `127.0.0.1` 且必带随机 `api_key`** —— 上游示例的 `:7863` 会绑 `0.0.0.0`（实测 `netstat` 可见），而网关在 `api_key` 为空时**完全不鉴权**，`/status` 会暴露账号与积分。
 - **装二进制前必须校验 SHA256，且拿不到校验和就拒绝安装** —— 下载的是**会被执行的文件**。校验和清单缺失时"下都下了就装"等于没有校验。
 - **`auths/` 目录必须先于网关启动而存在** —— 网关只在启动时探测该目录，不可读就永久跳过 `auths` 热加载（实测日志：`[watch] auths 目录 ./auths 不可读，跳过热加载监听（加账号后需手动重启）`），之后新增账号不会再被自动加载。
+- **栅栏必须以方法形式调用（`connection.requestRejection(req)`），不能摘成裸函数** —— cordis 的服务是 Proxy（`createTraceable` + `createShadowMethod`），摘下来调用时 `this` 会落到一个没有 `browserAuth` 的影子上并抛 `Cannot read properties of undefined (reading 'isAuthenticated')`；`catch` 把它按 403 处理后，又会被「回环端口跳转容忍」放行 ⇒ **栅栏看起来在工作，其实浏览器会话那一半从没跑过**（实测：摘下来时无 cookie 的请求也返回 200）。`tests/unit/api.spec.ts` 有一条用例钉住这个调用形式。
+- **宿主路由必须同时挂 `/wb2api` 与 `/api/wb2api`，且注册要配反注册** —— 桌面 app 的界面层只把 `/api/*` 转给宿主；而 `webServer.register` 对重复的 `(kind, path)` 会抛，`ctx.inject` 的回调却会重跑（连接被替换、热重载）。不配对反注册的后果不是报错，而是**第二次注册之后卡片再也没有数据**。
 - **启动轨迹写不进去也必须当没写** —— 插件自己往 `<dsh home>/.wb2api/boot.log` 追加一行行锚点（`apply: …` / `settings: acquired` / `credential: …` / `seed: …`），因为 `ctx.logger` 的输出在这套运行形态里进不了 host 日志，而顶部那条 `console.log('[workbuddy2api] module loaded')` 只回答「插件跑没跑」——这个文件才回答「跑到哪一步、结果是什么」。它**每一处都包在 `try/catch` 里全吞**（`src/boot-trace.ts`），跟 `state.json` 同一目录但**追加写、不清空不轮转**：一次追踪写失败若能把启动搞挂，那它就比它诊断的那个问题更糟；而清空会让「上一次启动发生了什么」正好在最需要它的时候消失。（`--rebuild` 的墓碑读写结果也在轨迹里 —— 「没有记录」渲染成 `none`，与「记录是空的」`0` 分得开。）
 
 ---

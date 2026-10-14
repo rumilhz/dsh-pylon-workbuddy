@@ -29,6 +29,7 @@ import {
   countModels,
   diffProviderModels,
   findProviderNamespace,
+  providerExists,
   renderProviderNotes,
   seedEditableProvider,
   type ProviderProfile,
@@ -40,6 +41,13 @@ import {
 import { openTombstone } from './plugin-state.js'
 import { trace } from './boot-trace.js'
 import { maskNickname } from './nickname.js'
+import {
+  createPanelApi,
+  pickCheckinAccount,
+  registerPanelRoutes,
+  type PanelApiDeps,
+  type PanelRouteContext,
+} from './api.js'
 import {
   defaultBackupDir,
   judgeWrite,
@@ -62,7 +70,9 @@ import {
   LoginClient,
   LoginPendingError,
   parseRealmArg,
+  readAuthFile,
   realmEndpoints,
+  requestDailyCheckin,
   writeAuthFile,
   type Realm,
 } from './login.js'
@@ -97,11 +107,27 @@ export {
   LoginPendingError,
   loginHeaders,
   parseRealmArg,
+  readAuthFile,
   realmEndpoints,
+  requestDailyCheckin,
   resolveRealmInput,
   writeAuthFile,
 } from './login.js'
-export type { AuthFileDocument, LoginResult, Realm } from './login.js'
+export type { AuthFileDocument, CheckinOutcome, LoginResult, Realm } from './login.js'
+export {
+  API_ROUTE_PREFIX,
+  CHECKIN_NOTE,
+  createHostRouteHandler,
+  createPanelApi,
+  isLoopbackPortHop,
+  pickCheckinAccount,
+  registerPanelRoutes,
+  ROUTE_BODY_LIMIT,
+  ROUTE_PATHS,
+  ROUTE_PREFIX,
+  stripRoutePrefix,
+} from './api.js'
+export type { ActionBody, PanelApiDeps, PanelBody, PanelRouteContext } from './api.js'
 export { renderSetupReport, SetupRunner } from './setup.js'
 export type { SetupOutcome, SetupStep, StepStatus } from './setup.js'
 export { extractFile, listEntries, ZipError } from './zip.js'
@@ -1663,6 +1689,73 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   } else {
     trace(`seed: 跳过（registerOwnProvider=true —— 自带路由与可编辑 provider 互斥）`)
   }
+
+  // ⑥ 设置卡片的后端半边：宿主 web 路由上的两个端点（`<prefix>/panel` 与 `<prefix>/action`）。
+  //
+  // 三条已实测的契约（出处见 `_施工说明-从Trae搬能力.md` C1 节与 `插件\dsh-trae\src\index.ts:514-596`）：
+  //   ① `webServer.register({kind:'prefix', path, handler})` 对**重复的 (kind, path) 会抛**；
+  //   ② `ctx.inject` 的回调**会重跑**（connection/webServer 被替换、热重载）
+  //      ⇒ 必须配一个 `ctx.effect` 反注册，否则第二次跑就抛，卡片从此没有数据通道；
+  //   ③ 桌面 app 的界面层**只把 `/api/*` 转给宿主**（裸路径被那一层自己挡成 403）
+  //      ⇒ **两条前缀都要挂**（`webServer` 最长前缀优先，两条不会互相抢）。
+  // 另外：必须**连 connection 一起 inject** —— `requestRejection` 是栅栏，缺了它宁可没有路由。
+  const panelDeps: PanelApiDeps = {
+    baseURL: config.baseURL,
+    providerName: config.providerName,
+    // 探活超时（默认 3s）。四个读是并行的，所以整体不会叠加成四倍。
+    timeoutMs: Math.max(1000, config.healthTimeoutSeconds * 1000),
+    // 一次真实补全给足时间：默认 requestTimeoutSeconds（600s）。
+    chatTimeoutMs: Math.max(1000, config.requestTimeoutSeconds * 1000),
+    resolveApiKey: () => apiKeyResolver(),
+    listAccounts: () => accountStore.list(),
+    // provider 现状**只读**：不写、不重建（重建是 `/action` 的事，且要用户点）。
+    providerFacts: async () => {
+      const settings = ctx.get('settings') as SettingsServiceLike | undefined
+      if (settings === undefined) return undefined
+      const namespace = findProviderNamespace(settings, config.providerNamespace)
+      if (namespace === undefined) return undefined
+      const exists = providerExists(namespace, config.providerName)
+      return {
+        exists,
+        ns: namespace.ns,
+        modelCount: exists ? countModels(namespace.providers[config.providerName]) : 0,
+      }
+    },
+    lastOffered: () => {
+      const profile = ctx.get('profileContext') as ProfileContextLike | undefined
+      return openTombstone({ providerName: config.providerName, profileHome: profile?.home })?.read()?.length
+    },
+    // 与 `/wb2api-provider --rebuild` 走**同一条路径**（overwrite=true ⇒ 只增不删）。
+    rebuild: () => ensureEditableProvider(ctx, config, () => apiKeyResolver(), true),
+    // ★ 签到：**只有用户点了**才会走到这里（没有任何定时器/启动钩子会调它）。
+    checkin: async () => {
+      const account = pickCheckinAccount(accountStore.list())
+      if (account === undefined) {
+        return { attempted: false, ok: false, detail: '没有启用的 CN 账号 —— 未发请求（上游只实测了 CN 的签到端点）。' }
+      }
+      const document = readAuthFile(account.file)
+      if (document === undefined) {
+        return { attempted: false, ok: false, detail: `凭证文件不可用（缺 uid 或 accessToken）：${basename(account.file)}` }
+      }
+      const outcome = await requestDailyCheckin({
+        realm: document.auth.realm,
+        credential: { accessToken: document.auth.accessToken, domain: document.auth.domain },
+        identity: { uid: document.account.uid, enterpriseId: document.account.enterpriseId },
+      })
+      trace(`api: checkin realm=${document.auth.realm} attempted=${String(outcome.attempted)} ok=${String(outcome.ok)}`)
+      return { attempted: outcome.attempted, ok: outcome.ok, detail: outcome.detail }
+    },
+    trace,
+  }
+
+  // 打这一行的理由：没有 webServer 的组合（例如 headless）里，回调**根本不会跑**，
+  // 而「卡片没数据」与「插件没加载」在日志里长得一模一样。
+  trace(
+    "api: 路由延迟注册（ctx.inject(['connection','webServer'])）—— 两者缺任一个，设置卡片就没有数据，"
+    + '网关托管 / 命令 / 可编辑 provider 都不受影响',
+  )
+  // 端点实现是**无状态**的，所以只造一次、在多次重注册之间复用。
+  registerPanelRoutes(ctx as unknown as PanelRouteContext, { api: createPanelApi(panelDeps), trace })
 
   const origin = gatewayOrigin(config.baseURL)
   ctx.logger.info(

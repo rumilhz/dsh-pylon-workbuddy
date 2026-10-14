@@ -28,7 +28,7 @@
  * @module dsh-workbuddy2api/login
  */
 
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** realm 取值。 */
@@ -146,6 +146,109 @@ export interface LoginResult {
 
 /** 登录所需的最小 fetch 形状（便于测试注入）。 */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
+
+/** 一次日签要用到的凭据（只要这两项；refreshToken 之类不参与请求）。 */
+export interface CheckinCredential {
+  accessToken: string
+  /** `auth.domain`，非空时作为 `X-Domain` 发出去。 */
+  domain: string
+}
+
+/** 一次日签要用到的账号身份。 */
+export interface CheckinIdentity {
+  uid: string
+  /** `account.enterpriseId`，非空时同时作为 `X-Enterprise-Id` 与 `X-Tenant-Id`。 */
+  enterpriseId: string
+}
+
+/**
+ * 一次「每日签到」调用的结果。
+ *
+ * `attempted` 与 `ok` 是**两个不同的问题**，刻意分开：
+ *   · `attempted: false` —— 我们**一个请求都没发**（global 没有该端点，或拿不到凭据）；
+ *   · `attempted: true, ok: false` —— 发了，上游拒绝了（例如「今天已签到」）。
+ * 设置卡片要能显示「真的点了才发请求」，所以这两件事不能挤进一个布尔。
+ */
+export interface CheckinOutcome {
+  attempted: boolean
+  ok: boolean
+  /** 给人看的一行；语义与登录流程里那份回执逐字一致。 */
+  detail: string
+}
+
+/**
+ * 每日签到（**直连上游，不经网关**）—— 从 `LoginClient` 里抽出来的独立函数。
+ *
+ * 抽出来的理由：设置卡片的签到按钮与登录流程里的「顺手签一次」是**两条调用路径**，
+ * 而它们必须打同一个端点、带同一组头。留两份实现迟早会漂移。
+ *
+ * ⚠️ **合规口径（不是可选项）**：官方明文禁止「利用脚本、外挂、插件、模拟器、
+ * **接口调用**……刷取活跃或奖励」。因此本函数**只在用户显式点击时**被调用，
+ * 插件里**没有任何自动签到路径**（定时器、启动钩子、重试都没有）。
+ *
+ * 失败只回报文本、绝不抛：签到失败不该影响登录结果，也不该让设置卡片崩掉。
+ *
+ * @param options - realm、凭据、身份；`fetchImpl` / `timeoutMs` 可注入（测试用）。
+ * @returns {@link CheckinOutcome}。
+ */
+export async function requestDailyCheckin(options: {
+  realm: Realm
+  credential: CheckinCredential
+  identity: CheckinIdentity
+  fetchImpl?: FetchLike
+  timeoutMs?: number
+}): Promise<CheckinOutcome> {
+  const endpoints = realmEndpoints(options.realm)
+  if (endpoints.checkinBase === undefined) {
+    return { attempted: false, ok: false, detail: '该 realm 没有签到端点（上游只实测了 CN），未发请求。' }
+  }
+  const fetchImpl = options.fetchImpl ?? fetch
+  const { credential, identity } = options
+  try {
+    const response = await fetchImpl(`${endpoints.checkinBase}/v2/billing/meter/daily-checkin`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${credential.accessToken}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-User-Id': identity.uid,
+        ...identity.enterpriseId !== '' ? { 'X-Enterprise-Id': identity.enterpriseId, 'X-Tenant-Id': identity.enterpriseId } : {},
+        ...credential.domain !== '' ? { 'X-Domain': credential.domain } : {},
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+    })
+    const body = await response.json().catch(() => undefined) as { code?: number; msg?: string; data?: unknown } | undefined
+    if (body === undefined) return { attempted: true, ok: false, detail: `HTTP ${response.status}` }
+    if (body.code === 0) return { attempted: true, ok: true, detail: `成功 ${JSON.stringify(body.data ?? {}).slice(0, 150)}` }
+    return { attempted: true, ok: false, detail: body.msg ?? `HTTP ${response.status}` }
+  } catch (error) {
+    return { attempted: true, ok: false, detail: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * 读回 `/wb2api-login` 写下的那份 auth 文件。
+ *
+ * 只认「能被网关消费」的那两项：`account.uid` 与 `auth.accessToken`。缺任一项都当
+ * 「这份文件不可用」（返回 `undefined`）—— 拿着半份凭证去签到只会得到一个 401。
+ *
+ * @param file - auth 文件绝对路径。
+ * @returns 解析结果；读不到 / 不是 JSON / 缺字段时 `undefined`。
+ */
+export function readAuthFile(file: string): AuthFileDocument | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const raw = parsed as { account?: Record<string, unknown>; auth?: Record<string, unknown> }
+    const uid = raw.account?.['uid']
+    const accessToken = raw.auth?.['accessToken']
+    if (typeof uid !== 'string' || uid === '' || typeof accessToken !== 'string' || accessToken === '') return undefined
+    return parsed as AuthFileDocument
+  } catch {
+    return undefined
+  }
+}
 
 /** 登录客户端：三个上游调用 + 一个可选的签到。 */
 export class LoginClient {
@@ -267,31 +370,19 @@ export class LoginClient {
    *
    * 完全对齐 `login.sh` 的行为：**失败只提示，绝不影响登录结果**（凭证此时已经拿到，
    * 因为签到失败就让整次登录失败是本末倒置）。global 不签到（上游标注该端点未实测）。
+   *
+   * 实现已经搬到模块级的 {@link requestDailyCheckin}（设置卡片的签到按钮走同一个函数），
+   * 这里只把结果翻译回「一行文本 / 什么都没发」这个旧契约。
    */
   async checkin(realm: Realm, token: TokenBundle, account: AccountInfo): Promise<string | undefined> {
-    const endpoints = realmEndpoints(realm)
-    if (endpoints.checkinBase === undefined) return undefined
-    try {
-      const response = await this.fetchImpl(`${endpoints.checkinBase}/v2/billing/meter/daily-checkin`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token.accessToken}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'X-User-Id': account.uid,
-          ...account.enterpriseId !== '' ? { 'X-Enterprise-Id': account.enterpriseId, 'X-Tenant-Id': account.enterpriseId } : {},
-          ...token.domain !== '' ? { 'X-Domain': token.domain } : {},
-        },
-        body: '{}',
-        signal: AbortSignal.timeout(15_000),
-      })
-      const body = await response.json().catch(() => undefined) as { code?: number; msg?: string; data?: unknown } | undefined
-      if (body === undefined) return `HTTP ${response.status}`
-      if (body.code === 0) return `成功 ${JSON.stringify(body.data ?? {}).slice(0, 150)}`
-      return body.msg ?? `HTTP ${response.status}`
-    } catch (error) {
-      return error instanceof Error ? error.message : String(error)
-    }
+    const outcome = await requestDailyCheckin({
+      realm,
+      credential: { accessToken: token.accessToken, domain: token.domain },
+      identity: { uid: account.uid, enterpriseId: account.enterpriseId },
+      fetchImpl: this.fetchImpl,
+      timeoutMs: this.timeoutMs,
+    })
+    return outcome.attempted ? outcome.detail : undefined
   }
 }
 
