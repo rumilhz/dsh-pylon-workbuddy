@@ -5,8 +5,8 @@
 装上之后：
 
 - **dsh 启动时自动拉起网关，退出时自动回收**；端口上已有健康网关在跑则直接复用，不重复拉起，也不会去杀别人的进程。
-- **模型目录自动同步** —— 模型列表、上下文窗口、输出上限、思考档位全部从网关 `GET /v1/models` 实时读取，不必再手写 `settings.yaml` 里的模型元数据。
-- **6 条管理命令**：`/wb2api-setup` · `/wb2api-status` · `/wb2api-start` · `/wb2api-restart` · `/wb2api-login` · `/wb2api-account`。
+- **把模型目录落成「设置 → 模型」里那份可编辑的 provider** —— 首次启动时读网关 `GET /v1/models`，把每个模型的上下文窗口 / 输出上限 / 输入模态 / 思考档位按实测值写进 `llm-pi-ai.providers.workbuddy`；此后**只在你删空它时才会重建**，你在模型页筛掉的模型不会被补回来。
+- **7 条管理命令**：`/wb2api-setup` · `/wb2api-status` · `/wb2api-provider` · `/wb2api-start` · `/wb2api-restart` · `/wb2api-login` · `/wb2api-account`。
 - **一条命令完成安装**：`/wb2api-setup` 会取回网关可执行文件（校验 SHA256）、准备运行目录、引导登录、启动网关并同步模型 —— **不需要装 Go，也不需要 python3 / bash**。
 
 插件本身很薄：协议适配、账号池、加权选号、分级熔断、定时任务、登录与 token 刷新**全部留在 Go 网关侧**。它只负责两件事 —— 进程生命周期，和模型目录自动化。
@@ -15,15 +15,41 @@
 
 ## 它解决什么
 
-直接用手工配置把 workbuddy2api 接进 dsh（在 `~/.dsh/settings.yaml` 里写 `llm-pi-ai.providers.workbuddy2api`）也能用，但有几处手工负担：
+直接用手工配置把 workbuddy2api 接进 dsh（写一段 `llm-pi-ai.providers.workbuddy`）也能用，但有几处手工负担：
 
 | 问题 | 手工接法 | 本插件 |
 |---|---|---|
-| **模型元数据** | 每个模型的 `contextWindow` / `maxTokens` / `reasoningEfforts` / `input` 全手抄；网关增删模型必须手改文件 | 运行时读 `/v1/models` 自动映射 |
+| **模型元数据** | 每个模型的 `contextWindow` / `maxTokens` / `reasoningEfforts` / `input` 全手抄；网关增删模型必须手改文件 | 首次启动读 `/v1/models`，按实测值把整份清单写进那段 provider 配置 |
 | **进程管理** | dsh 启动前必须另行常驻 `wb2a-server.exe`，退出也不联动 | 插件托管子进程，生命周期绑定 dsh |
 | **获取网关二进制** | 装 Go 工具链 → `git clone` 上游 → `go build` | `/wb2api-setup` 自动下载 + SHA256 校验 |
 | **账号登录** | 上游 `login.sh` 需要 **bash + python3**（Windows 上基本劝退） | 插件内置同款 OAuth 流程，纯 Node 实现 |
 | **可分发** | 配置只存在于本机，别人拿不到 | 一个 npm 包，装上即可用 |
+
+### provider 出现在哪、谁说了算
+
+**一份配置，两个消费者。** 插件的模型目录不是运行时路由，而是写进 `llm-pi-ai` 的
+provider 配置（settings namespace 就是 profile 条目 id）：
+
+```
+llm-pi-ai:                    ← profile 条目，settings namespace
+  config:
+    providers:
+      workbuddy:              ← 插件首次启动时按 /v1/models 生成的那一份
+        api: openai-completions
+        baseURL: http://127.0.0.1:7863/v1
+        apiKeyEnv: WORKBUDDY2API_API_KEY
+        models: [...]         ← 你在「设置 → 模型」里编辑的就是这里
+```
+
+这样做的收益是**它同时是路由、又是可编辑的配置**：聊天窗口的模型选择器、子代理的
+模型路由、以及「设置 → 模型 → 供应商」页读到的是同一份，你在页面上删掉一个模型，
+聊天选择器里立刻就没有它了。
+
+代价是目录**默认只在首次创建时**从网关同步，之后不再跟着网关变 —— 这是刻意的，见
+[已知限制](#已知限制)。想看网关后来多出哪些模型，用只读的
+`/wb2api-provider`：它打印差异，不写任何东西。确认要按网关重建整份清单时，用
+`/wb2api-provider --rebuild`（**会覆盖你在模型页做的筛选**，所以只有你显式敲下它才会执行；
+写入带安全网：写前把 patch 备份到 **profile 之外**、写后独立读回核对条目数、不对就自动回滚）。
 
 ### 字段映射
 
@@ -88,7 +114,7 @@
 **不需要先下载文件** —— pnpm 支持直接以 Release 的 tarball URL 作为依赖（已实测：装出来是真实目录、非 `link:`）：
 
 ```bash
-dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/releases/download/v0.3.2/dsh-workbuddy2api-0.3.2.tgz
+dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/releases/download/v0.4.0/dsh-workbuddy2api-0.4.0.tgz
 ```
 
 升级时把 URL 里的版本号换掉即可。
@@ -98,7 +124,7 @@ dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/relea
 在 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases/latest) 下载 `dsh-workbuddy2api-<版本>.tgz`，然后：
 
 ```bash
-dsh plugin --profile web add file:/绝对路径/dsh-workbuddy2api-0.3.2.tgz
+dsh plugin --profile web add file:/绝对路径/dsh-workbuddy2api-0.4.0.tgz
 ```
 
 ### 方式三：从源码安装
@@ -109,20 +135,24 @@ cd dsh-workbuddy2api
 npm install
 node node_modules/typescript/bin/tsc -p tsconfig.json   # 必须先构建出 lib/
 npm pack --pack-destination dist
-dsh plugin --profile web add file:./dist/dsh-workbuddy2api-0.3.2.tgz
+dsh plugin --profile web add file:./dist/dsh-workbuddy2api-0.4.0.tgz
 ```
 
 > **不要用 `dsh plugin install <源码目录>`**：pnpm 会写成 `link:` 依赖，而 Windows 上工具进程创建的 junction 不可遍历，会导致 pnpm 全面失效。用 `npm pack` / `pnpm pack` 出的 tarball（解包成真实目录）可规避。
 
 > **关于 npm registry（重要，别装错）**：npm 上的 **`dsh-workbuddy2api` 这个包名已被他人占用**
 > —— 发布者是 [Boiser](https://www.npmjs.com/~boiser)，线上版本为 `0.4.9` ~ `0.6.8`（`latest = 0.6.8`），
-> 与本仓库（`tearslee/dsh-workbuddy2api`，当前 `0.3.2`）**不是同一个项目**。
+> 与本仓库（`tearslee/dsh-workbuddy2api`，当前 `0.4.0`）**不是同一个项目**。
+>
+> ⚠️ **两边从 `0.4.x` 起版本号会撞车，别再靠版本号区分**：本仓库从 `0.4.0` 进入这条线，
+> npm 上那个同名包也停在 `0.4.9` ~ `0.6.8`。**唯一可靠的区分方式是来源（URL / tarball）。**
 >
 > 因此：
 >
 > - ❌ **不要执行 `dsh plugin add dsh-workbuddy2api`** —— 它会装到那个同名包，而不是本插件；
 > - ✅ 请用上面三种方式之一，从**本仓库的 GitHub Release** 取 `dsh-workbuddy2api-<版本>.tgz`；
-> - 装完请核对来源与版本：本仓库的版本线是 `0.1.x` / `0.3.x`（`0.4.x` 及以上均非本仓库产物）。
+> - 装完请核对**来源**：本仓库的版本线是 `0.1.x` / `0.3.x` / `0.4.x`，且只从
+>   `github.com/tearslee/dsh-workbuddy2api` 的 Release 分发。
 >
 > 本仓库未在 npm 发布，也无意与同名包竞争该名称 —— 安装时**认 URL / 认 tarball**，不要只认包名。
 
@@ -247,7 +277,8 @@ dsh 起来之后，在对话里执行：
 | 命令 | 作用 |
 |---|---|
 | `/wb2api-setup [cn\|global]` | **一键就绪**：准备可执行文件、运行目录、账号，启动网关并同步模型目录 |
-| `/wb2api-status` | 网关状态、账号可用性（`healthy/total`）、各 realm 可服务性、模型数量、账号清单（启用/禁用 + 积分/冷却） |
+| `/wb2api-status` | 网关状态、账号可用性（`healthy/total`）、各 realm 可服务性、模型数量、账号清单（启用/禁用 + 积分/冷却）、provider 归属 |
+| `/wb2api-provider [--create\|--rebuild]` | **只读**打印「网关当前目录」与「你配的 provider」的差异（新增/下架/数值不一致）；加 `--create` 只在 provider **缺失**时按网关目录创建，从不改写已有清单；加 `--rebuild` 则连**已存在**的也按网关目录整份重建（**会覆盖你在模型页做的筛选**）。两个写入开关都带写路径安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚 |
 | `/wb2api-start` | 启动网关（幂等：已在运行则直接复用） |
 | `/wb2api-restart` | 重启网关并刷新模型目录 |
 | `/wb2api-login [cn\|global]` | 登录一个 WorkBuddy 账号（浏览器授权，凭证写入 `auths/`） |
@@ -304,7 +335,7 @@ dsh 起来之后，在对话里执行：
 - **无账号时网关「启动 ≠ 可用」。** 进程起来但 `/healthz` 报 `healthy: 0`，插件会把状态标为「运行中（无可用账号）」而不是假装成功。
 - **切换账号仍会重启网关。** 切换靠重命名凭证文件实现（见上）。较新的网关有 5 秒热加载能自行感知，本插件仍走一次重启以确保新旧二进制行为一致，代价是中断正在进行的请求 1~3 秒。
 - **预编译产物来自本仓库的 CI，可能与上游最新提交有延迟。** 想紧跟上游就自行 `go build`（把 `binaryPath` 指向你的产物，插件不会覆盖它）。上游若改动凭证格式或路由，本插件的适配可能滞后。
-- **模型不出现在「设置 → 模型」页，只在聊天窗口的模型选择器里。** 这是 dsh 的既定设计，不是本插件的缺陷：设置页本质是**配置文件编辑器**，`dsh-client-ui-settings-models` 只认 `llm-deepseek` 与 `llm-pi-ai` 两个 settings namespace，其余不渲染 provider 行；而本插件的 provider 是**代码注册的运行时路由**，模型目录来自网关 `/v1/models`，本就不属于那个界面管辖。要确认模型可用：看聊天窗口的模型选择器，或执行 `/wb2api-status`。
+- **模型目录默认只在首次创建 provider 时同步一次，之后不再跟着网关变。** 这是刻意的取舍：你会在「设置 → 模型」里把自动生成的整份清单删到真正要用的那几个，任何「自动补齐 / 自动同步」都会把删掉的模型重新塞回来。因此装填逻辑是**存在即什么都不做** —— 插件升级到新版本同样不会碰你筛过的清单。要手动看差异用只读的 `/wb2api-provider`（打印「网关有而你没配」「你配了而网关已下架」「数值不一致」三组，**不写任何东西**）；要在 provider 缺失时按网关目录创建整份清单用 `/wb2api-provider --create`；要让**已存在**的 provider 也按网关目录整份重建（网关后来新增了模型、你想一次拉全），用 `/wb2api-provider --rebuild` —— 它会**覆盖你在模型页做的筛选**，所以是个显式开关，插件自己永远不会主动选它。**两条写入路径都带安全网**：写前把 profile patch 备份到 **profile 之外**，写后独立读回核对条目数，条目变少就自动回滚并说明原因。如果 provider 缺失且创建失败（settings 不可用、写入被拒、网关连不上），插件会把一份**可直接粘贴**的 YAML 打进日志，并明确说明「此时引用它的路由指向一个不存在的 provider」—— 它不会替你猜数值，也不会删改任何既有配置。
 
 ---
 
@@ -322,7 +353,10 @@ dsh 起来之后，在对话里执行：
 
 ### 启动日志出现 provider 注册被拒（`DUPLICATE_ADAPTER`）
 
-插件注册 `workbuddy2api` 路由后，如果 `~/.dsh/settings.yaml` 里还留着同名 provider，会看到：
+**只有把 `registerOwnProvider` 设成 `true`（回退到 0.3.x 的自带路由）时才可能看到这条。**
+默认路径不注册自带路由，因此不会出现这个冲突。
+
+回退路径下如果 settings 里已有同名 provider，会看到：
 
 ```
 [workbuddy2api] provider 目录注册被拒：configurable provider "workbuddy2api" is already declared
@@ -361,7 +395,11 @@ pwsh -File scripts/migrate-settings.ps1
 
 脚本会打印回滚命令（把自动备份拷回来即可）。
 
-> **为什么必须在 dsh 关闭时执行**：`settings.yaml` 是被**热监听**的（dsh-settings-file 用 chokidar 监视）。在 dsh 运行中删掉该段会立刻生效，而插件那份 provider 要等重启才会注册 —— 中间窗口里模型会不可用，正在进行的会话可能直接失败。
+> **为什么必须在 dsh 关闭时执行**：settings 文件是被**热监听**的。在 dsh 运行中删掉该段会立刻生效，而插件那份 provider 要等重启才会注册 —— 中间窗口里模型会不可用，正在进行的会话可能直接失败。
+
+> **0.4.0 起这段迁移只在回退路径下才需要**：默认不再注册自带路由，settings 里存在
+> 同名 provider 不会再冲突（插件会把它当成「操作员自己写的那一份」并**原样不碰**）。
+> 换句话说 `scripts/migrate-settings.ps1` 现在是一个历史遗留工具，用不用都不影响启动。
 
 ---
 
@@ -394,7 +432,8 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.ts` | 插件入口：注册 provider、命令、生命周期 |
+| `src/index.ts` | 插件入口：命令、生命周期、自动启动、provider 装填的接线 |
+| `src/provider-config.ts` | 生成「设置 → 模型」里那份可编辑 provider：namespace 探测、存在性判定、字段映射、只读差异、失败时的可粘贴 YAML |
 | `src/config.ts` | 插件配置 schema 与默认值 |
 | `src/models.ts` | `/v1/models` 拉取、映射、TTL 缓存 |
 | `src/gateway-adapter.ts` | `LlmAdapter` 实现：请求组装 + SSE → `StreamChunk` |
@@ -419,7 +458,13 @@ node node_modules/vitest/vitest.mjs run --config vitest.e2e.config.ts
 - **`function.name` 只在非空时更新** —— 后续分片带 `""`（不是 `undefined`），直接覆盖会导致 `unknown tool ""`。
 - **残缺工具参数报 `max-tokens` 而不是 `tool-calls`** —— 报 `tool-calls` 会让 harness 执行半截 JSON 并把脏参数写进会话历史，报 `max-tokens` 才会丢弃并重试。
 - **`readWithIdleTimeout` 的 abort 分支也要 reject** —— 只清定时器会让 `Promise.race` 永远悬空，generator 既不产出也不返回。
-- **provider 注册冲突只记日志、不抛错** —— 冲突意味着用户还没迁移旧配置，此时抛错会让 dsh 起不来，把一个可用环境变成完全不可用。
+- **provider 注册冲突只记日志、不抛错** —— 冲突意味着用户还没迁移旧配置，此时抛错会让 dsh 起不来，把一个可用环境变成完全不可用。（0.4.0 起这只在 `registerOwnProvider: true` 的回退路径上才可能发生。）
+- **自带 provider 的模型配置是「存在即不碰」，只创建、永不改写** —— 你会在「设置 → 模型」里把它删到只剩几个，任何自动补齐都会把删掉的模型塞回来。判定要看 `describe()` 的 `value` / `base` / `user` **三层**：只要任意一层提到这个名字就什么都不做。
+- **生成配置时字段缺失就不写，并且要说出来** —— pi-ai 对缺失的 `contextWindow` 会静默套用 262144（`dsh-llm-pi-ai/lib/index.js:675`、`DEFAULT_CONTEXT_WINDOW` 在 `:927`），猜一个数字比缺字段更危险。缺了就报「网关未下发 contextWindow」，由你决定补什么。
+- **`reasoningEfforts` 用恒等映射（`high: high`）** —— 网关报的档位就是它自己接受的线上值（上游 issue #84「客户端可发现档位，不再盲传」），pi-ai 会把这个值原样塞进请求体的 `reasoning_effort`（`@earendil-works/pi-ai/dist/api/openai-completions.js:712-715`），本仓库自己的适配器对同一个网关发的也是同一个字段同一个值（`src/gateway-adapter.ts:391-394`）。
+- **不在 pi-ai 档位枚举（`off/minimal/low/medium/high/xhigh/max`）内的档位要过滤掉再写** —— `reasoningEfforts` 的**键**是 `z.union(THINKING_LEVELS)`，多一个键会让整次 `mutate` 校验失败，连带把这次创建一起拖垮。过滤掉但在日志里点名。
+- **装填步骤与自动启动是两步、不是串行** —— provider 已存在时这一步根本不需要网关；串在 `supervisor.start()` 之后会让「网关起不来」连带吞掉「provider 归属的确认」，而那正是最需要说清楚的时候。
+- **`Config` 里不能加 volatile 字段** —— `dsh-settings` 只暴露带 volatile 字段的条目，而供应商列表按条目渲染；本插件一旦被暴露，页面上就会多出第二个（不可编辑的）provider 行。`tests/unit/plugin-load.spec.ts` 有一条用例专门钉这件事。
 - **切换账号的顺序必须是「停 → 改名 → 启」** —— 网关运行中会用内存里的旧 `FilePath` 把凭证原子写回，改名会被它撤销。所以 `/wb2api-account` 刻意不用 `supervisor.restart()`（它无法在停与启之间插一步动作）；改名本身失败时也会把网关拉回来，不把环境留在「网关已停」。
 - **自动下载必须同时生成 `config.json`** —— 上游 `main.go` 写了「配置不存在就用默认值+环境变量」的兜底，但它用 `os.IsNotExist()` 判断一个**已被 `fmt.Errorf("read config: %w", …)` 包装过**的错误，永远为假，于是进程直接 `log.Fatalf` 退出（实测：二进制放进空目录执行，4 秒内退出，只留一行 `load config: read config: open config.json: …`）。所以插件必须自己写这份配置。
 - **生成的配置只监听 `127.0.0.1` 且必带随机 `api_key`** —— 上游示例的 `:7863` 会绑 `0.0.0.0`（实测 `netstat` 可见），而网关在 `api_key` 为空时**完全不鉴权**，`/status` 会暴露账号与积分。

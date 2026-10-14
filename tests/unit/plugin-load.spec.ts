@@ -1,18 +1,21 @@
 /**
  * 插件装载集成测试：把**构建产物**装进一个真实的 cordis Context，
- * 用真实的 `@deepseek-ai/dsh-llm` 运行时注册 provider 与适配器。
+ * 用真实的 `@deepseek-ai/dsh-llm` 运行时跑一遍默认路径。
  *
  * 这一层补上了单元测试够不到的地方：
- *  - `ctx.llm.registerConfigurableProviders()` / `registerAdapter()` 的真实校验
- *    （`info.id === provider`、`DUPLICATE_ADAPTER` 冲突检测）；
- *  - `ctx.commands.register()` 的命令清单；
- *  - `Config` schema 能否被 `toJSON()`（settings 注册的硬要求）。
+ *  - 默认**不**注册自带路由（`registerConfigurableProviders` / `registerAdapter`
+ *    都不该被调用）—— 那正是「设置 → 模型」里第二个不可编辑行的来源；
+ *  - `ctx.commands.register()` 的命令清单（含新的 `/wb2api-provider`）；
+ *  - `Config` schema 能否被 `toJSON()`（settings 描述条目的硬要求）；
+ *  - `Config` **不含 volatile 字段** —— 一旦含了，本插件的条目就会在
+ *    「设置 → 模型」里多出一行，本文件最后一条用例专门钉这件事。
  *
  * **为什么整个文件共用同一个 Context**：cordis 的根服务注册表是**进程级共享**的，
  * 第二次 `ctx.provide('llm', ...)` 会报 `service "llm" has been registered at <root>`；
  * 而 `ctx.isolate(name, label)` 对**相同 label 会合并作用域**，也救不了同一文件内的
  * 多次建树。vitest 默认按文件隔离模块，因此「一个文件一个 Context」是唯一干净的切法；
- * `plugin-degrade.spec.ts` 单独覆盖需要另建一棵树的降级路径。
+ * 需要另建一棵树的路径各自单独成文件（`plugin-degrade` / `plugin-route-conflict` /
+ * `plugin-legacy-provider` / `plugin-provider-seed`）。
  */
 
 import { dirname, join } from 'node:path'
@@ -71,6 +74,7 @@ describe.skipIf(!hasKernel())('插件装载（真实 cordis + dsh-llm）', () =>
     void new llm.LlmRuntime(ctx as never)
     void new commands.CommandRuntime(ctx as never)
     ctx.provide('subprocess', fakeSubprocess())
+    // 刻意**不**提供 settings：默认路径下没有 settings 只应降级，不该阻止加载。
 
     // autoStart: false —— 测试不拉起真实进程；端口用一个必然空闲的高端口。
     plugin.apply(ctx, { autoStart: false, baseURL: 'http://127.0.0.1:59993/v1' })
@@ -82,7 +86,7 @@ describe.skipIf(!hasKernel())('插件装载（真实 cordis + dsh-llm）', () =>
     expect(typeof plugin.apply).toBe('function')
   })
 
-  it('Config schema 可被 toJSON()（settings.describe 的硬要求）', () => {
+  it('Config schema 可被 toJSON()（settings 描述条目的硬要求）', () => {
     // 传裸函数会让 settings.describe() 抛
     // `registration.schema.toJSON is not a function`，进而拖垮整个设置页。
     expect(typeof plugin.Config.toJSON).toBe('function')
@@ -91,47 +95,32 @@ describe.skipIf(!hasKernel())('插件装载（真实 cordis + dsh-llm）', () =>
     expect(Object.keys(json as object).length).toBeGreaterThan(0)
   })
 
-  it('provider 成功注册进真实 LlmRuntime', () => {
-    const providers = ctx.llm.listProviders()
-    expect(providers.map(provider => provider.id)).toContain('workbuddy2api')
-    // 契约要求 name 非空，且 providerInfo().id === 注册的路由名。
-    expect(providers.find(provider => provider.id === 'workbuddy2api')?.name.length).toBeGreaterThan(0)
+  it('Config 不含 volatile 字段 —— 否则供应商列表会多出本插件这一行', () => {
+    // dsh-settings 只暴露带 volatile 字段的条目；本插件一旦被暴露，模型页就会渲染
+    // 第二个（不可编辑的）provider 行，正是这次改动要消除的东西。
+    const json = plugin.Config.toJSON() as { dict?: Record<string, { meta?: { volatile?: unknown } }> }
+    const volatileFields = Object.entries(json.dict ?? {})
+      .filter(([, node]) => node.meta?.volatile !== undefined)
+      .map(([key]) => key)
+    expect(volatileFields).toEqual([])
   })
 
-  it('可配置 provider 目录里也有该路由（模型设置页据此展示）', () => {
-    const entry = ctx.llm.listConfigurableProviders().find(item => item.provider === 'workbuddy2api')
-    expect(entry).toBeDefined()
-    expect(entry?.settingsNs).toBe('llm-workbuddy2api')
+  it('默认【不】注册自带路由（workbuddy2api 不在 provider 清单里）', () => {
+    expect(ctx.llm.listProviders().map(provider => provider.id)).not.toContain('workbuddy2api')
   })
 
-  it('四个管理命令都注册成功', () => {
+  it('默认【不】声明可配置 provider 目录（模型页不会有第二行）', () => {
+    expect(ctx.llm.listConfigurableProviders().map(item => item.provider)).not.toContain('workbuddy2api')
+  })
+
+  it('五个管理命令都注册成功（含只读的 /wb2api-provider）', () => {
     const listed = ctx.commands.list({} as never).map(descriptor => descriptor.name)
-    for (const expected of ['wb2api-status', 'wb2api-start', 'wb2api-restart', 'wb2api-login']) {
+    for (const expected of ['wb2api-status', 'wb2api-start', 'wb2api-restart', 'wb2api-login', 'wb2api-provider']) {
       expect(listed).toContain(expected)
     }
   })
 
-  it('同一路由重复注册被拒（迁移冲突的可检出行径）', () => {
-    // settings.yaml 里残留旧 provider 时，dsh 启动就会走到这条路径。
-    // 真实错误：code = `DUPLICATE_ADAPTER`，人类可读消息为
-    // `an adapter for provider "workbuddy2api" is already registered`
-    // —— 消息里**不含** code 字样，所以迁移排障要认 code 或这句英文。
-    class Dummy extends llm.LlmAdapter {
-      // eslint-disable-next-line require-yield
-      async *stream(): AsyncIterable<never> { throw new Error('unused') }
-    }
-    let caught: unknown
-    try {
-      ctx.llm.registerAdapter(['workbuddy2api'], new Dummy())
-    } catch (error) {
-      caught = error
-    }
-    expect(caught).toBeInstanceOf(Error)
-    expect((caught as { code?: string }).code).toBe('DUPLICATE_ADAPTER')
-    expect((caught as Error).message).toMatch(/already registered/)
-  })
-
-  it('真实基类提供插件覆盖的全部方法（不只是 tsc 层面兼容）', () => {
+  it('真实基类提供适配器覆盖的全部方法（回退路径仍要能跑）', () => {
     for (const method of ['providerInfo', 'listModels', 'resolveModel', 'prepareCall']) {
       expect(typeof (llm.LlmAdapter.prototype as unknown as Record<string, unknown>)[method]).toBe('function')
     }

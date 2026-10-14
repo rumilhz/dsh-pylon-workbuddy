@@ -1,6 +1,8 @@
 /**
- * 路由冲突降级测试：settings.yaml 里仍留着同名 provider 时（「装了插件但还没做迁移」），
- * 插件必须**照常加载完毕**，而不是让整个 dsh 起不来。
+ * 回退路径的路由冲突降级测试：`registerOwnProvider: true` 时插件仍走 0.3.x 的
+ * 「注册自带路由」逻辑，而该路由可能已被同名配置占用（「装了插件但还没做迁移」）。
+ *
+ * 这时插件必须**照常加载完毕**，而不是让整个 dsh 起不来。
  *
  * 单独成文件的原因见 `plugin-load.spec.ts` 顶部注释：cordis 的服务注册表按根 Context
  * 隔离，而一个文件里重复 apply 同一个插件会撞上命令重复注册（那是同一 ctx 的编程错误，
@@ -15,8 +17,8 @@ import { hasKernel, resolveKernel } from '../kernel-resolver.js'
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 // 需要真实内核才能建 cordis 树：探测不到就跳过，避免别人的 checkout 红一片。
-describe.skipIf(!hasKernel())('provider 路由被外部配置占用时的降级', () => {
-  it('插件不抛错，dsh 仍可启动，日志指出该删哪一段', async () => {
+describe.skipIf(!hasKernel())('回退路径：provider 路由被外部配置占用时的降级', () => {
+  it('插件不抛错，dsh 仍可启动，且占位者的路由不受影响', async () => {
     const cordis = await import(resolveKernel('cordis'))
     const llm = await import(resolveKernel('dsh-llm'))
     const commands = await import(resolveKernel('dsh-commands'))
@@ -42,7 +44,7 @@ describe.skipIf(!hasKernel())('provider 路由被外部配置占用时的降级'
       spawnTerminal: async () => { throw new Error('n/a') },
     })
 
-    // 模拟 settings.yaml 里的手工 provider：目录条目与适配器都已被占用。
+    // 模拟外部配置里的同名 provider：目录条目与适配器都已被占用。
     ctx.llm.registerConfigurableProviders([{
       provider: 'workbuddy2api',
       displayName: '手工配置的 workbuddy2api',
@@ -56,7 +58,11 @@ describe.skipIf(!hasKernel())('provider 路由被外部配置占用时的降级'
     ctx.llm.registerAdapter(['workbuddy2api'], new Occupier())
 
     // 两处注册都已被占用 —— 插件必须捕获并降级，而不是把异常抛给 dsh 启动流程。
-    expect(() => plugin.apply(ctx, { autoStart: false, baseURL: 'http://127.0.0.1:59988/v1' })).not.toThrow()
+    expect(() => plugin.apply(ctx, {
+      autoStart: false,
+      registerOwnProvider: true,
+      baseURL: 'http://127.0.0.1:59988/v1',
+    })).not.toThrow()
 
     // 路由仍在（属于占位者），因此 dsh 启动后模型照常可用，只是走旧适配器。
     expect(ctx.llm.listProviders().map(provider => provider.id)).toContain('workbuddy2api')

@@ -1,25 +1,48 @@
 /**
- * dsh 插件入口：注册 provider 路由、托管网关进程、提供管理命令。
+ * dsh 插件入口：托管网关进程、维护「设置 → 模型」里那份可编辑 provider、提供管理命令。
  *
  * 三块职责：
  *   ① 进程托管 —— `GatewaySupervisor` 拉起 wb2api 并绑定生命周期；
- *   ② provider —— 注册 `workbuddy2api` 路由，`listModels`/`resolveModel` 打 `/v1/models`；
- *   ③ 管理面 —— `/wb2api-status` / `/wb2api-start` / `/wb2api-restart` / `/wb2api-login`。
+ *   ② provider —— 把网关 `/v1/models` 落成 `llm-pi-ai.providers.<providerName>`
+ *      那一份**可编辑**配置（存在即不改写，见 `provider-config.ts`）；
+ *   ③ 管理面 —— `/wb2api-status` / `/wb2api-start` / `/wb2api-restart` / `/wb2api-login`
+ *      / `/wb2api-provider`。
  *
  * 职责边界：协议适配、账号池、熔断、定时任务全部留在 Go 侧。插件只解决
  * 「进程生命周期」与「模型目录自动化」两件事。
+ *
+ * 关于「自带适配器」：`GatewayAdapter` 仍在仓库里，但**默认不再注册**。它是
+ * 0.3.x 的架构，只在 `registerOwnProvider: true` 的回退路径上启用 —— 那条路径下
+ * 模型目录由适配器直连 `/v1/models` 提供，代价是它在「设置 → 模型」里永远不可编辑。
  *
  * @module dsh-workbuddy2api
  */
 
 import { existsSync, readFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import Schema from '@deepseek-ai/schemastery'
 import { resolveConfig, gatewayOrigin, PROVIDER, SETTINGS_NS, type GatewayPluginConfig } from './config.js'
-import { mapModelCatalog, ModelCatalog } from './models.js'
+import { fetchModelList, mapModelCatalog, ModelCatalog, readCatalogEntries } from './models.js'
+import {
+  countModels,
+  diffProviderModels,
+  findProviderNamespace,
+  renderProviderNotes,
+  seedEditableProvider,
+  type ProviderProfile,
+  type SeedOutcome,
+  type SettingsServiceLike,
+  type WriteGuard,
+} from './provider-config.js'
+import {
+  defaultBackupDir,
+  judgeWrite,
+  probeEntryCount,
+  rollbackPatch,
+  snapshotPatch,
+} from './write-guard.js'
 import { GatewayAdapter } from './gateway-adapter.js'
 import { GatewaySupervisor } from './gateway-supervisor.js'
 import {
@@ -79,67 +102,262 @@ export { renderSetupReport, SetupRunner } from './setup.js'
 export type { SetupOutcome, SetupStep, StepStatus } from './setup.js'
 export { extractFile, listEntries, ZipError } from './zip.js'
 
+/**
+ * 模块级「我加载了」信号。
+ *
+ * **为什么必须用 `console.log` 而不是 `ctx.logger`**（2026-10-14 实测发现）：
+ * 在这套 desktop / web 运行形态里，`ctx.logger` 的输出**不进** host 的标准输出，
+ * 也不进 `%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*.log`；而兄弟插件
+ * （`subagent-router` / `acp-harness` / `dsh-cost-meter`）全部走 `console.log`，
+ * 因而在日志里看得见。后果是：本插件出问题时**无法从日志判断它到底跑没跑**。
+ *
+ * 这一行的诊断价值在于区分两种沉默：
+ *   · 模块**没被 import**     → 这一行不出现；
+ *   · import 了但 `apply` 没跑 → 这一行出现、而 apply 那行不出现
+ *     （cordis 在 inject 服务缺失时会让插件停在 PENDING，**不报错**）。
+ */
+console.log('[workbuddy2api] module loaded')
+
 /** 插件实例 id。必须与 `cordis.patch.yml` 里的 `id` 一致。 */
 export const name = 'workbuddy2api'
 
 /**
  * 依赖的服务。
  *
- * 只注入真正必需的三个：`llm` 注册适配器、`subprocess` 托管进程、`commands` 注册
- * 斜杠命令。`settings` 与 `credentials` 走 `ctx.get()` 按需取 —— 它们在 web profile
- * 里恒存在，但缺失时插件仍应能加载（只是模型设置页少一个 namespace 地址）。
+ * 只注入真正必需的三个：`llm` 注册适配器（仅 `registerOwnProvider: true` 时用到）、
+ * `subprocess` 托管进程、`commands` 注册斜杠命令。`settings` 与 `credentials` 走
+ * `ctx.get()` 按需取 —— 它们在 web profile 里恒存在，但缺失时插件仍应能加载
+ * （只是自动创建 provider 这一步降级成「打印手工块」）。
  */
 export const inject = ['llm', 'subprocess', 'commands']
 
 /**
- * provider 配置 namespace 的 schema。
+ * ⚠️ **本插件无法注册自己的 settings namespace —— 这个能力在当前 dsh 内核里不存在。**
  *
- * `registerConfigurableProviders` 声明的 `settingsNs` 必须真实存在于 settings
- * 服务中，否则模型设置页读到 undefined 的 namespace，在
- * `refFor → deriveKeyRef(provider)` 处会以 `provider.toUpperCase is not a function`
- * 崩溃。
+ * 0.3.x 及更早的版本在这里调 `settings.register(SETTINGS_NS, schema)`，好让
+ * `registerConfigurableProviders` 声明的 `settingsNs` 有个落点。**那段代码从未生效过**：
+ * `@deepseek-ai/dsh-settings@0.2.0-rc.2` 导出的 `SettingsForms` 只有
+ * `configure` / `describe` / `update` / `replace` / `mutate` / `write` / `schema`
+ * （`dsh-settings/lib/index.js:322-542`），**没有任何 `register` 方法**。
+ * 于是调用必然抛 `TypeError: settings.register is not a function`，被就地 catch 成
+ * 一条 warn，除了在启动日志里留噪音之外什么也没做。
  *
- * **注意**：`settings.register()` 要求 schemastery schema —— `describe()` 会对每个
- * 注册项无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`。传入裸函数
- * （`(value) => ...`）会让 `describe()` 抛
- * `TypeError: registration.schema.toJSON is not a function`，进而使所有依赖 settings
- * 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）全部失败。
- * 因此这里**必须**用 `Schema.object({...})` 构造。
+ * 现在它被删掉了，因为它指向的那条设计路径已经作废：settings namespace **就是
+ * profile 条目 id**，而「设置 → 模型」只渲染 `llm-deepseek` / `llm-pi-ai` 两个条目。
+ * 插件要出现在那个页面上，唯一可行的做法是**写进 pi-ai 的 provider 配置**
+ * （见 `provider-config.ts`），而不是给自己造一个 namespace。
+ *
+ * `SETTINGS_NS` 仍然导出，因为它是 0.3.x 的公开导出面的一部分；它现在只在
+ * `registerOwnProvider: true` 的回退路径里被引用。
  */
-const providerSettingsSchema = Schema.object({
-  providers: Schema.dict(Schema.any()).default({}),
-})
 
-/** 注册 provider 配置 namespace（已存在时忽略重复注册错误）。 */
-function registerProviderSettings(ctx: Context): void {
-  const settings = ctx.get('settings') as
-    | {
-      register: (ns: string, schema: unknown) => unknown
-      describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
-    }
-    | undefined
-  if (settings === undefined || typeof settings.register !== 'function') {
-    ctx.logger.warn('[workbuddy2api] settings 服务不可用，provider namespace 未注册')
-    return
-  }
+/**
+ * 等 Loader 把 profile 里的插件条目都激活。
+ *
+ * 必需的理由：settings namespace **就是 profile 条目 id**，而 `describe()` 只列
+ * `fiber.state === 2`（已激活）的条目。插件自己的 `apply()` 跑在 Loader 组合过程中，
+ * 此刻 `llm-pi-ai` 多半还没激活 —— 不等就会误判成「没有这个 namespace」。
+ *
+ * `ctx.root.loader.await()` 在老内核里可能不存在，且有极小的概率 reject；两种情形都
+ * 只是让后面那几轮重试去兜底，不该把异常抛给 dsh 启动流程。
+ */
+async function waitForLoaderSettled(ctx: Context): Promise<void> {
+  const loader = (ctx.root as unknown as { loader?: { await?: () => Promise<unknown> } }).loader
   try {
-    settings.register(SETTINGS_NS, providerSettingsSchema)
-  } catch (error) {
-    ctx.logger.warn(`[workbuddy2api] settings namespace "${SETTINGS_NS}" 注册失败: ${String(error)}`)
-    return
+    await loader?.await?.()
+  } catch {
+    // 交给 seedEditableProvider 的 namespace 重试。
   }
-  // 回读确认：模型设置页要求 settingsNs 真实存在于 describe() 中。
-  try {
-    const descriptors = settings.describe?.({ redactSecrets: true }) ?? []
-    const registered = descriptors.map(item => item.ns)
-    if (!registered.includes(SETTINGS_NS)) {
-      ctx.logger.warn(`[workbuddy2api] provider namespace 未生效: ${SETTINGS_NS}`)
+}
+
+/** `profileContext` 服务里本插件真正用到的那几个字段。 */
+interface ProfileContextLike {
+  /** profile 目录（`~/.dsh/profiles/<name>`）。 */
+  dir: string
+  /** profile patch 的绝对路径。 */
+  patchPath: string
+  /** DSH 数据根（`~/.dsh`）。 */
+  home: string
+}
+
+/**
+ * 把 `write-guard.ts` 接到真 profile 上。
+ *
+ * 拿不到 patch 路径时返回 `undefined`，于是 `seedEditableProvider` 会**拒绝写入**
+ * 并降级成「打印手工块」。这个降级方向是刻意的：没有退路的写入能力宁可不启用，
+ * 也不能裸写 —— 那正是 2026-10-08 事故的成因。
+ *
+ * @param ctx - 插件上下文（取 profileContext / configEditor 定位 patch）。
+ * @param config - 插件配置（备份目录可覆盖）。
+ * @returns 安全网；无法定位 patch 时为 undefined。
+ */
+function createWriteGuard(ctx: Context, config: GatewayPluginConfig): WriteGuard | undefined {
+  const profile = ctx.get('profileContext') as ProfileContextLike | undefined
+  const fromEditor = (ctx.get('configEditor') as { documentPath?: unknown } | undefined)?.documentPath
+  const patchPath = typeof profile?.patchPath === 'string' && profile.patchPath.length > 0
+    ? profile.patchPath
+    : (typeof fromEditor === 'string' ? fromEditor : undefined)
+  if (patchPath === undefined) return undefined
+  const backupDir = config.writeBackupDir.trim().length > 0
+    ? config.writeBackupDir
+    : defaultBackupDir(profile?.home ?? dirname(patchPath))
+  const options = { patchPath, backupDir }
+  return {
+    snapshot: async () => await snapshotPatch(options),
+    verify: async (baseline, expected) => {
+      // 两路探针各抓一种失败：
+      //   · 磁盘条目数 —— 抓"文件被整份截断"（事故形态，内存里的 describe 看不见）；
+      //   · settings 读回 —— 抓"这次写入根本没落地"。
+      const entryCount = await probeEntryCount(options)
+      const namespace = findProviderNamespace(
+        ctx.get('settings') as SettingsServiceLike | undefined,
+        config.providerNamespace,
+      )
+      const value = namespace?.providers[config.providerName]
+      return judgeWrite(
+        baseline,
+        { entryCount, providerPresent: value !== undefined, modelCount: countModels(value) },
+        expected,
+      )
+    },
+    rollback: async baseline => { await rollbackPatch(options, baseline) },
+  }
+}
+
+/**
+ * 把「可编辑 provider 是否存在」这件事收敛成一次调用。
+ *
+ * `fetchEntries` 默认只在 provider **缺失**时才会被调用（存在性判定在拉目录之前），
+ * 所以日常启动不会多打一次 `/v1/models`。`overwrite` 为 true 时（`--rebuild`）
+ * 已存在的 provider 也会被覆盖，那时才会去拉目录。
+ *
+ * @param ctx - 插件上下文。
+ * @param config - 插件配置。
+ * @param resolveApiKey - 取网关凭据。
+ * @param overwrite - 已存在时是否整份覆盖；默认 false（绝不改写）。
+ * @returns 本次的动作与说明。
+ */
+async function ensureEditableProvider(
+  ctx: Context,
+  config: GatewayPluginConfig,
+  resolveApiKey: () => Promise<string | undefined>,
+  overwrite = false,
+): Promise<SeedOutcome> {
+  await waitForLoaderSettled(ctx)
+  return await seedEditableProvider({
+    settings: ctx.get('settings') as SettingsServiceLike | undefined,
+    providerName: config.providerName,
+    preferredNamespace: config.providerNamespace,
+    apiKeyEnv: config.apiKeyRef,
+    baseURL: config.baseURL,
+    overwrite,
+    guard: createWriteGuard(ctx, config),
+    fetchEntries: async () => readCatalogEntries(await fetchModelList({
+      baseURL: config.baseURL,
+      apiKey: await resolveApiKey(),
+      timeoutMs: config.healthTimeoutSeconds * 1000,
+    })),
+  })
+}
+
+/** 手工粘贴块的抬头（说清贴到哪一层，粘错层级不会报错、只会被静默忽略）。 */
+function manualBlockHeader(): string {
+  return '把下面这段贴进 profile 的 cordis.patch.yml，位置是 llm-pi-ai → config → providers 之下'
+    + '（与 opencode-go / xiaomi 等同级；缩进已对齐，直接粘即可）：'
+}
+
+/**
+ * 把 {@link SeedOutcome} 渲染成日志/命令文本。
+ *
+ * 分支文案集中在这里，避免「启动日志」与「`/wb2api-provider` 输出」两处漂移。
+ *
+ * @param outcome - 本次结果。
+ * @param config - 插件配置（取 provider 名与端点）。
+ * @returns 多行文本（不带前缀，调用方决定 logger 级别）。
+ */
+function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): string {
+  const name = config.providerName
+  switch (outcome.kind) {
+    case 'present':
+      return `可编辑 provider "${name}" 已存在于 settings 条目 "${outcome.ns}"（${outcome.modelCount} 个模型）`
+        + ' —— 未做任何改动（存在即不碰，操作员筛选过的模型不会被补回来）。'
+    case 'created': {
+      const lines = [
+        `已创建可编辑 provider "${name}"（settings 条目 "${outcome.ns}"，${outcome.modelCount} 个模型，`
+        + `上下文窗口与输出上限全部来自网关 /v1/models 的实测值）。`,
+        '现在可以在「设置 → 模型」里增删这个 provider 的模型；删掉之后插件不会再补回来。',
+      ]
+      if (outcome.notes.length > 0) {
+        lines.push('生成时有字段被略过（插件不猜数值，请自行核对）：')
+        lines.push(...renderProviderNotes(outcome.notes))
+      }
+      return lines.join('\n')
     }
-  } catch (error) {
-    ctx.logger.error(
-      '[workbuddy2api] settings.describe 失败（将导致模型设置页/sidebar settings API 不可用）: '
-      + `${error instanceof Error ? error.stack ?? error.message : String(error)}`,
-    )
+    case 'rebuilt': {
+      const delta = outcome.modelCount - outcome.previousModelCount
+      const lines = [
+        `已按网关目录**重建** provider "${name}"（settings 条目 "${outcome.ns}"）：`
+        + `${outcome.previousModelCount} → ${outcome.modelCount} 个模型。`,
+        delta > 0
+          ? `（净增 ${delta} 个 —— 既有网关新增的，也有你之前在模型页删掉、这次被拉回来的。）`
+          : delta < 0
+            ? `（净减 ${-delta} 个 —— 网关下架或改名了。）`
+            : '（数量没变，但数值已按网关当前的实测值重写。）',
+      ]
+      if (outcome.droppedModels.length > 0) {
+        lines.push(`⚠ 下面这 ${outcome.droppedModels.length} 个模型你原本配置里有、而网关现在没有了，`
+          + '重建之后**不再出现在清单里**：')
+        lines.push(`  ${outcome.droppedModels.join(', ')}`)
+      }
+      lines.push('⚠ 这次是**整份覆盖**：你在「设置 → 模型」里删掉的模型已经全部回来。'
+        + '\n（写前已备份到 profile 之外，写后核对过条目数；核对不通过会自动回滚并说明。）')
+      if (outcome.notes.length > 0) {
+        lines.push('生成时有字段被略过（插件不猜数值，请自行核对）：')
+        lines.push(...renderProviderNotes(outcome.notes))
+      }
+      return lines.join('\n')
+    }
+    case 'skipped':
+      return outcome.reason === 'no-settings-service'
+        ? `无法自动创建 provider "${name}"：${outcome.detail}。`
+          + `\n插件仍会托管网关；模型目录需要手工写进 llm-pi-ai.providers.${name}。`
+        : `无法自动创建 provider "${name}"：${outcome.detail}。`
+          + '\n（settings namespace 就是 profile 条目 id；只有根级 providers 是 dict 的条目才是候选。）'
+    case 'rolled-back': {
+      // 这个分支必须显眼：它是"刚才差点出事、已经被挡住"的信号。
+      // 过去这种情形会一路走到 created，把"写坏了"报告成"写好了"。
+      const lines = [
+        `🔴 provider "${name}" 的写入**已被写路径安全网拦下并回滚**。`,
+        '这次 mutate 返回了「成功」，但写后读回校验发现配置不对，所以没有采信它的结果：',
+        ...outcome.reasons.map(reason => `  · ${reason}`),
+        outcome.recovery,
+      ]
+      if (outcome.notes.length > 0) {
+        lines.push('生成时有字段被略过（插件不猜数值，请自行核对）：')
+        lines.push(...renderProviderNotes(outcome.notes))
+      }
+      lines.push('', manualBlockHeader(), outcome.manualBlock.replace(/\n$/, ''))
+      return lines.join('\n')
+    }
+    case 'failed': {
+      const lines: string[] = []
+      if (outcome.reason === 'gateway-unreachable') {
+        lines.push(`⚠ provider "${name}" 不存在，且拉不到网关模型目录：${outcome.detail}`)
+        lines.push(`⚠ 此时 ${'`'}agent_provider: ${name}${'`'} 的多条路由指向一个不存在的 provider。`
+          + '插件不会替你猜数值 —— 请确认网关已启动（/wb2api-start）后重跑 /wb2api-provider --create。')
+      } else {
+        lines.push(`⚠ provider "${name}" 不存在，且写入 settings 失败：${outcome.detail}`)
+        lines.push('插件没有改动任何既有配置，系统停在与本次启动之前相同的状态。')
+      }
+      if (outcome.notes.length > 0) {
+        lines.push(...renderProviderNotes(outcome.notes))
+      }
+      if (outcome.manualBlock !== undefined) {
+        lines.push('', manualBlockHeader(), outcome.manualBlock.replace(/\n$/, ''))
+        lines.push('（贴完保存即可，dsh 会热加载 profile patch；不确定就先备份该文件。）')
+      }
+      return lines.join('\n')
+    }
   }
 }
 
@@ -443,8 +661,24 @@ function renderAccountSection(
 export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): void {
   const config = resolveConfig(rawConfig)
 
-  // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  registerProviderSettings(ctx)
+  // ★ 启动即留下一条**同步、且在日志里看得见**的信号。
+  //
+  // 两重诊断价值：
+  //   ① 它是同步写的，出现即证明 `apply` 确实执行了 —— `ensureEditableProvider` 挂在
+  //      `setTimeout(0)` 上、又被 `timer.unref()` 放手，是 fire-and-forget；它没跑完时
+  //      日志会一片空白，让人分不清"插件没 mount"和"mount 了但那件事没说话"。
+  //   ② 用 `console.log` 而非 `ctx.logger`：理由见模块顶部那条注释 ——
+  //      在这套运行形态里 `ctx.logger` 的输出不进 host 日志，写了等于没写。
+  console.log(
+    `[workbuddy2api] apply 开始：provider=${config.providerName}`
+    + ` · namespace=${config.providerNamespace.length > 0 ? config.providerNamespace : '(自动探测)'}`
+    + ` · registerOwnProvider=${String(config.registerOwnProvider)}`
+    + ` · writeBackupDir=${config.writeBackupDir.length > 0 ? config.writeBackupDir : '(默认: <dsh home>/wb2api-write-backups)'}`,
+  )
+
+  // 这里曾经调 `registerProviderSettings(ctx)`。该能力在当前 dsh 内核里不存在
+  // （`dsh-settings` 没有 `register`），调用只会被 catch 成一条噪音 warn；
+  // 删除理由与替代路径见上方 `inject` 后的长注释与 `provider-config.ts`。
 
   const subprocess = ctx.get('subprocess') as SubprocessRuntime | undefined
   if (subprocess === undefined) {
@@ -520,49 +754,67 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   // 凭据解析是异步初始化（动态 import），完成后适配器即可读到。
   void makeApiKeyResolver(ctx, config).then((resolver) => { apiKeyResolver = resolver })
 
-  // ① provider 目录 + 适配器注册。
+  // ① provider 归属。
   //
-  // 两处注册都可能在「settings.yaml 里仍留着 llm-pi-ai.providers.workbuddy2api」时
-  // 失败（就是「装了插件但还没做迁移」）：
+  // **默认不再注册插件自带的 `workbuddy2api` 路由**（`registerOwnProvider: true`
+  // 可回退）。自带路由是代码注册的运行时路由：它在「设置 → 模型」里永远是不可编辑
+  // 的第二行，而它的模型目录直接来自 `/v1/models`，会绕过操作员在模型页做的筛选。
+  // 现在改由 ② 把目录写成 `llm-pi-ai.providers.<providerName>` 那一份可编辑配置。
+  //
+  // 两者互斥：同一个名字被注册两次会撞 `DUPLICATE_ADAPTER`，所以回退路径下不生成
+  // provider 配置（见下方 ② 的 `config.registerOwnProvider` 判定）。
+  //
+  // 回退路径里的两处注册都可能失败（settings 里已存在同名 provider 声明）：
   //   - registerConfigurableProviders → `configurable provider "workbuddy2api" is already declared`
   //   - registerAdapter               → `an adapter for provider "workbuddy2api" is already registered`
   //     （code = DUPLICATE_ADAPTER，消息里不含 code 字样）
   //
-  // 这里**故意捕获后只记日志、不向上抛**。那种状态下旧配置本来工作正常，若抛错会让整个
-  // dsh 起不来，把一个可用环境变成完全不可用。降级后：dsh 照常启动、模型仍走 settings.yaml
-  // 里那份手工配置，而日志与 `/wb2api-status` 都明确指出该删哪一段。
+  // 那里**故意捕获后只记日志、不向上抛**。那种状态下旧配置本来工作正常，若抛错会让整个
+  // dsh 起不来，把一个可用环境变成完全不可用。
   let routeOwnedByOther = false
 
-  try {
-    // 让模型设置页知道这条路由存在（即使尚未激活）。
-    ctx.llm.registerConfigurableProviders([
-      {
-        provider: PROVIDER,
-        displayName: 'WorkBuddy (workbuddy2api 网关)',
-        settingsNs: SETTINGS_NS,
-        settingsPath: ['providers', PROVIDER],
-        // 这条路由是插件自带的，不是用户手写的配置声明。
-        declared: false,
-      },
-    ])
-  } catch (error) {
-    routeOwnedByOther = true
-    logRouteConflict(ctx, 'provider 目录', error)
-  }
+  if (config.registerOwnProvider) {
+    try {
+      // 让模型设置页知道这条路由存在（即使尚未激活）。
+      ctx.llm.registerConfigurableProviders([
+        {
+          provider: PROVIDER,
+          displayName: 'WorkBuddy (workbuddy2api 网关)',
+          settingsNs: SETTINGS_NS,
+          settingsPath: ['providers', PROVIDER],
+          // 这条路由是插件自带的，不是用户手写的配置声明。
+          declared: false,
+        },
+      ])
+    } catch (error) {
+      routeOwnedByOther = true
+      logRouteConflict(ctx, 'provider 目录', error)
+    }
 
-  try {
-    ctx.llm.registerAdapter([PROVIDER], adapter)
-  } catch (error) {
-    routeOwnedByOther = true
-    logRouteConflict(ctx, '适配器', error)
-  }
+    try {
+      ctx.llm.registerAdapter([PROVIDER], adapter)
+    } catch (error) {
+      routeOwnedByOther = true
+      logRouteConflict(ctx, '适配器', error)
+    }
 
-  if (routeOwnedByOther) {
-    ctx.logger.error(
-      `[workbuddy2api] provider 路由 "${PROVIDER}" 由外部配置占用（见上条）。`
-      + '请删除 ~/.dsh/settings.yaml 里的 llm-pi-ai.providers.workbuddy2api 段后重启 dsh；'
-      + 'provider id 相同，agent-default-model / subagent-model-selection 的引用无需改动。'
-      + '在删除之前，模型请求仍走 settings.yaml 里那份手工配置。',
+    if (routeOwnedByOther) {
+      ctx.logger.error(
+        `[workbuddy2api] provider 路由 "${PROVIDER}" 由外部配置占用（见上条）。`
+        + '请删除 settings 里 llm-pi-ai.providers.workbuddy2api 段后重启 dsh；'
+        + 'provider id 相同，agent-default-model / subagent-model-selection 的引用无需改动。'
+        + '在删除之前，模型请求仍走那份手工配置。',
+      )
+    }
+    ctx.logger.info(
+      `[workbuddy2api] registerOwnProvider=true：已按旧行为注册自带路由 "${PROVIDER}"；`
+      + `此时【不会】自动创建可编辑 provider "${config.providerName}"。`
+      + '要让它在「设置 → 模型」里可编辑，请把 registerOwnProvider 置回 false。',
+    )
+  } else {
+    ctx.logger.info(
+      `[workbuddy2api] 自带路由 "${PROVIDER}" 未注册（registerOwnProvider=false，默认）。`
+      + `模型目录将由可编辑 provider "${config.providerName}" 承载。`,
     )
   }
 
@@ -588,12 +840,108 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           ? `\n\n${renderAccountSection(accountStore.authDir(), inventory, live).join('\n')}`
           : `\n\n账号文件: 0 个（${accountStore.authDir()}）—— 先跑 ./login.sh 完成登录`
         // 路由被占用的状态必须显式暴露：此时插件托管了网关，但模型请求走的是
-        // settings.yaml 里那份手工配置 —— 不说清楚会让人以为插件没生效。
+        // 那份手工配置 —— 不说清楚会让人以为插件没生效。仅在回退路径
+        // （registerOwnProvider=true）下才可能出现。
         const routeLine = routeOwnedByOther
-          ? `\n\n⚠ provider 路由 "${PROVIDER}" 未由本插件注册（已被 settings.yaml 占用）。`
-            + '\n请删除 ~/.dsh/settings.yaml 里的 llm-pi-ai.providers.workbuddy2api 段后重启 dsh。'
+          ? `\n\n⚠ provider 路由 "${PROVIDER}" 未由本插件注册（已被同名配置占用）。`
+            + '\n请删除 settings 里的 llm-pi-ai.providers.workbuddy2api 段后重启 dsh。'
           : ''
-        return { kind: 'success', text: renderStatus(status, authFiles) + modelLine + accountLines + routeLine }
+        // 默认路径下真正的「provider 归属」是那条可编辑配置，状态里必须点名，
+        // 否则用户会以为模型仍由插件代码注册（旧行为的印象）。
+        const providerLine = config.registerOwnProvider
+          ? `\n\nprovider 归属: 插件自带路由 "${PROVIDER}"（registerOwnProvider=true，模型目录不可在设置页编辑）`
+          : `\n\nprovider 归属: 可编辑 provider "${config.providerName}"`
+            + `（写在 llm-pi-ai 配置里，见「设置 → 模型」；用 /wb2api-provider 查看与网关的差异）`
+        return {
+          kind: 'success',
+          text: renderStatus(status, authFiles) + modelLine + providerLine + accountLines + routeLine,
+        }
+      } catch (error) {
+        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  })
+
+  ctx.commands.register({
+    name: 'wb2api-provider',
+    description: '查看可编辑 provider 与网关目录的差异（只读）；--create 缺失时创建；--rebuild 按网关整份重建',
+    input: { hint: '[--create|--rebuild]' },
+    handler: async ({ rawInput }): Promise<CommandResult> => {
+      try {
+        const wantsCreate = /(^|\s)--create(\s|$)/.test(rawInput)
+        const wantsRebuild = /(^|\s)--rebuild(\s|$)/.test(rawInput)
+        if ((wantsCreate || wantsRebuild) && !config.registerOwnProvider) {
+          // `--rebuild` 与 `--create` 的唯一区别是**已存在时也覆盖**。
+          const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver(), wantsRebuild)
+          const header = wantsRebuild
+            ? '（显式 --rebuild：按网关目录整份覆盖现有清单 —— 你在模型页做的筛选会被覆盖。'
+              + '写入带安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。）\n'
+            : '（显式 --create：仅在 provider 缺失时创建，从不改写已有模型清单）\n'
+          return {
+            kind: outcome.kind === 'failed' ? 'error' : 'success',
+            text: header + renderSeedOutcome(outcome, config),
+          }
+        }
+        // 默认只读：绝不写任何东西，也绝不改动操作员筛选过的模型清单。
+        const namespace = findProviderNamespace(
+          ctx.get('settings') as SettingsServiceLike | undefined,
+          config.providerNamespace,
+        )
+        if (namespace === undefined) {
+          return {
+            kind: 'error',
+            text: '探测不到「根级 providers 是 dict」的 settings 条目 —— 无法确认 provider 归属。'
+              + '\nsettings namespace 就是 profile 条目 id；候选应形如 llm-pi-ai。'
+              + `\n可用 providerNamespace 配置项显式指定。`,
+          }
+        }
+        const current = namespace.providers[config.providerName]
+        if (current === undefined) {
+          return {
+            kind: 'error',
+            text: `⚠ provider "${config.providerName}" 在 settings 条目 "${namespace.ns}" 里**不存在**。`
+              + `\n引用了它的路由（agent_provider: ${config.providerName}）现在指向一个不存在的 provider。`
+              + '\n跑 /wb2api-provider --create 按网关目录创建它（需要网关已启动）。',
+          }
+        }
+        const profile = current as ProviderProfile
+        const configured = Array.isArray(profile.models) ? profile.models.length : 0
+        let body = `provider "${config.providerName}" @ settings 条目 "${namespace.ns}"：`
+          + `\n  已配置模型: ${configured} 个`
+          + `\n  api: ${String(profile.api ?? '(未写)')}｜baseURL: ${String(profile.baseURL ?? '(未写)')}`
+          + `\n  apiKeyEnv: ${String(profile.apiKeyEnv ?? '(未写)')}`
+        let entries
+        try {
+          entries = readCatalogEntries(await fetchModelList({
+            baseURL: config.baseURL,
+            apiKey: await apiKeyResolver(),
+            timeoutMs: config.healthTimeoutSeconds * 1000,
+          }))
+        } catch (error) {
+          return {
+            kind: 'success',
+            text: body + `\n\n（网关不可达，无法比对：${error instanceof Error ? error.message : String(error)}）`,
+          }
+        }
+        const diff = diffProviderModels(profile, entries)
+        body += `\n  网关当前服务: ${entries.length} 个`
+        body += diff.missingFromProfile.length > 0
+          ? `\n\n网关有、你没配的 ${diff.missingFromProfile.length} 个（**不会自动加**，要就去模型页加）：`
+            + `\n  ${diff.missingFromProfile.join(', ')}`
+          : '\n\n网关有、你没配的: 无'
+        body += diff.unknownToGateway.length > 0
+          ? `\n\n你配了、网关现在没有的 ${diff.unknownToGateway.length} 个（下架或改名）：`
+            + `\n  ${diff.unknownToGateway.join(', ')}`
+          : '\n你配了、网关现在没有的: 无'
+        body += diff.drifted.length > 0
+          ? `\n\n数值与网关不一致的 ${diff.drifted.length} 处（改不改由你决定）：`
+            + `\n${diff.drifted.map(item => `  · ${item.id} ${item.field}: 配置 ${item.configured} → 网关 ${item.gateway}`).join('\n')}`
+          : '\n数值与网关不一致的: 无'
+        body += '\n\n（本命令只读，不写任何东西。）'
+          + '\n· /wb2api-provider --create  —— 仅在 provider 缺失时创建，绝不改写已有清单。'
+          + '\n· /wb2api-provider --rebuild —— 按网关目录整份重建（**会覆盖你在模型页做的筛选**）。'
+          + '\n两者都带写路径安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。'
+        return { kind: 'success', text: body }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -1071,9 +1419,44 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: autostart timer')
   }
 
+  // ⑤ 可编辑 provider：与自动启动**并行**的独立一步。
+  //
+  // 独立成一步而不是挂在自动启动后面：provider 已存在时这一步根本不需要网关
+  // （存在性判定在拉目录之前），把它挂在 `supervisor.start()` 之后会让「网关起不来」
+  // 连带把「provider 归属的确认」也吞掉 —— 而那正是最需要说清楚的时候。
+  //
+  // 只在默认路径下做：回退路径（registerOwnProvider=true）注册的是插件自带路由，
+  // 同一个名字再写一份 pi-ai 配置会撞 DUPLICATE_ADAPTER。
+  if (!config.registerOwnProvider) {
+    const timer = setTimeout(() => {
+      void ensureEditableProvider(ctx, config, () => apiKeyResolver())
+        .then((outcome) => {
+          const text = `[workbuddy2api] ${renderSeedOutcome(outcome, config)}`
+          // 两处都发：stdout 保证「写路径到底发生了什么」在 host 日志里看得见，
+          // logger 保持走框架日志系统。理由见模块顶部那条注释 —— 2026-10-14 实测
+          // 发现只发 `ctx.logger` 等于没写，而这正是当时排查卡住的原因。
+          if (outcome.kind === 'failed') { console.error(text); ctx.logger.error(text) }
+          else if (outcome.kind === 'skipped') { console.warn(text); ctx.logger.warn(text) }
+          else { console.log(text); ctx.logger.info(text) }
+        })
+        .catch((error: unknown) => {
+          // 这一步的任何异常都不该影响 dsh 启动 —— 网关托管与命令面照常可用。
+          const text = `[workbuddy2api] 可编辑 provider 检查失败：${error instanceof Error ? error.message : String(error)}。`
+            + '可执行 /wb2api-provider 查看现状。'
+          console.error(text)
+          ctx.logger.error(text)
+        })
+    }, 0)
+    timer.unref?.()
+    ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: provider seed timer')
+  }
+
   const origin = gatewayOrigin(config.baseURL)
   ctx.logger.info(
-    `[workbuddy2api] provider "${PROVIDER}" 已注册（端点 ${config.baseURL}`
-    + `${config.autoStart ? `，启动后自动拉起 ${origin}` : '，未启用自动启动'}）`,
+    `[workbuddy2api] 端点 ${config.baseURL}`
+    + `${config.autoStart ? `，启动后自动拉起 ${origin}` : '，未启用自动启动'}；`
+    + `${config.registerOwnProvider
+      ? `自带路由 "${PROVIDER}" 已注册（旧行为）`
+      : `模型目录由可编辑 provider "${config.providerName}" 承载（启动后检查）`}`,
   )
 }

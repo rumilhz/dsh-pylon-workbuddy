@@ -8,6 +8,15 @@
 | 工程骨架来源 | `deepseek-harness-codearts`（gitee.com/iJetLi/deepseek-harness-codearts）的 buddy provider 构建链 |
 | 环境 | dsh `0.1.6-alpha.1`（单份全局安装，`<dsh 安装目录>/node_modules/@deepseek-ai/dsh`）|
 
+> **⚠️ §3.2「必须自带适配器，不能寄生于 llm-pi-ai」已于 2026-10-08 被推翻，请勿据此改代码。**
+> 当时的结论建立在「pi-ai 的 Config 是**静态**配置、模型元数据只能写死在文件里」这一前提上。
+> 该前提不成立：`@deepseek-ai/dsh-settings@0.2.0-rc.2` 提供了 `mutate(ns, ops, rev)`
+> （`dsh-settings/lib/index.js:488-500`），可以在运行时把 `/v1/models` 的实测元数据写进
+> `llm-pi-ai.providers.<name>`，于是那份配置**既是路由、又可编辑** —— 这正是自带适配器
+> 做不到的（它在「设置 → 模型」里永远是不可编辑的第二行）。
+> 现在默认路径走生成配置（`src/provider-config.ts`），自带适配器退居
+> `registerOwnProvider: true` 的回退路径。当前行为以 [../README.md](../README.md) 为准。
+
 > **读这份文档前请先看这里**：下文所有 `handler.go:229-256` 之类的**行号引用**对应的
 > 是 2026-09-15 的上游基线 `3b87c14`。上游此后前进了 127 个提交（当前基线 `a9ccace`），
 > 行号已整体漂移 —— 检索时请以**函数名**为准（`modelList()`、`healthz()`、

@@ -194,6 +194,113 @@ export function mapModelCatalog(body: unknown, policy: 'strip-cn' | 'keep'): Gat
   return [...byId.values()]
 }
 
+/**
+ * `/v1/models` 一条原始条目的只读投影，仅供「生成可编辑 provider 配置」使用
+ * （见 `provider-config.ts`）。
+ *
+ * 与 {@link GatewayModel} 的分工：那个是**运行时**投影（映射成 dsh 的
+ * `LlmResolvedModelInfo`，受 `realmPrefixPolicy` 影响）；这个是**落盘**投影，
+ * 保留网关的原始 id（含 realm 前缀）与原始字段名 —— 写进
+ * `llm-pi-ai.providers.<name>.models` 的 id 会被 pi-ai 原样发到网关上，而网关的
+ * `resolve_model.go` 只对**带前缀**的 id 做显式 realm 路由。
+ *
+ * 字段缺失时给 `undefined`（**不给兜底值**）：调用方必须能区分「网关说 960000」
+ * 与「网关没说」。后者不能猜一个数字写进配置 —— pi-ai 对缺失的 `contextWindow`
+ * 会静默套用 262144，那正是这套生成逻辑要避免的陷阱。
+ */
+export interface GatewayCatalogEntry {
+  /** 网关原始 id，**保留** `cn:` / `global:` 前缀。 */
+  id: string
+  /** 网关透出的展示名；空值省略。 */
+  name?: string
+  /** `context_length`；网关四级查找链的产物，正常路径上恒有值。 */
+  contextLength?: number
+  /** `max_output_tokens`；网关未收录时**整个键都不下发**。 */
+  maxOutputTokens?: number
+  /** `supports_images`；**仅在支持时出现**。 */
+  supportsImages?: boolean
+  /** `reasoning_supported_efforts`；空数组表示网关没声明档位。 */
+  reasoningEfforts: string[]
+  /** `reasoning_default_effort`；不在 `reasoningEfforts` 内时一并丢弃。 */
+  reasoningDefaultEffort?: string
+}
+
+/**
+ * 把 `GET /v1/models` 响应体投影成 {@link GatewayCatalogEntry} 列表。
+ *
+ * 只做**读取与类型收敛**，不做任何映射或兜底：`context_length` 非正数/非数一律
+ * 视为「网关没说」。id 非字符串或为空串的条目直接跳过（它们无法被寻址）。
+ *
+ * 与 {@link mapModelCatalog} 的两点差别是刻意的：**不去重**（配置生成要能看见网关
+ * 名单里的重复项，静默丢掉一条会让操作员以后对着两份名单发懵），也**不套用
+ * realmPrefixPolicy**（落盘的 id 要能显式寻址 realm）。
+ *
+ * @param body - 已解析的 `/v1/models` JSON。
+ * @returns 保持网关返回顺序的原始条目列表。
+ */
+export function readCatalogEntries(body: unknown): GatewayCatalogEntry[] {
+  const data = (body as { data?: unknown } | null | undefined)?.data
+  if (!Array.isArray(data)) return []
+  const entries: GatewayCatalogEntry[] = []
+  for (const raw of data) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const row = raw as Record<string, unknown>
+    if (typeof row.id !== 'string' || row.id.length === 0) continue
+    const efforts = toStringArray(row.reasoning_supported_efforts)
+    const rawDefault = typeof row.reasoning_default_effort === 'string' ? row.reasoning_default_effort : undefined
+    // 默认档必须是支持集的成员：网关偶尔会下发集合外的默认档，透出去会让选择器
+    // 显示一个该模型并不支持的档位（与 mapModel 的同一条判定）。
+    const defaultEffort = rawDefault !== undefined && efforts.includes(rawDefault) ? rawDefault : undefined
+    const contextLength = toPositiveNumber(row.context_length)
+    const maxOutputTokens = toPositiveNumber(row.max_output_tokens)
+    entries.push({
+      id: row.id,
+      ...typeof row.name === 'string' && row.name.length > 0 ? { name: row.name } : {},
+      ...contextLength !== undefined ? { contextLength } : {},
+      ...maxOutputTokens !== undefined ? { maxOutputTokens } : {},
+      ...row.supports_images === true ? { supportsImages: true } : {},
+      reasoningEfforts: efforts,
+      ...defaultEffort !== undefined ? { reasoningDefaultEffort: defaultEffort } : {},
+    })
+  }
+  return entries
+}
+
+/** `GET /v1/models` 的请求参数。 */
+export interface ModelListRequest {
+  /** 网关 OpenAI 兼容端点根，如 `http://127.0.0.1:7863/v1`。 */
+  baseURL: string
+  /** 网关 api_key；缺省时不带 `Authorization` 头（网关未配鉴权时同样能读）。 */
+  apiKey?: string
+  /** 整体超时（毫秒）。 */
+  timeoutMs: number
+}
+
+/**
+ * 拉取 `/v1/models` 的**原始**响应体。
+ *
+ * 单独抽出来的理由：运行时目录（{@link ModelCatalog} 的 `fetchCatalog`）与配置
+ * 生成（`provider-config.ts`）读的是同一份载荷的不同投影，共用这一个请求实现
+ * 可以让两边的端点拼接、鉴权头、超时与错误文案不会漂移。
+ *
+ * @param request - 端点、可选凭据与超时。
+ * @returns 已解析的 JSON（结构未校验，交给各自的读取器）。
+ * @throws 非 2xx 时抛错，消息含状态码。
+ */
+export async function fetchModelList(request: ModelListRequest): Promise<unknown> {
+  const response = await fetch(`${request.baseURL.replace(/\/+$/, '')}/models`, {
+    headers: {
+      accept: 'application/json',
+      ...request.apiKey !== undefined ? { authorization: `Bearer ${request.apiKey}` } : {},
+    },
+    signal: AbortSignal.timeout(request.timeoutMs),
+  })
+  if (!response.ok) {
+    throw new Error(`GET /v1/models 返回 HTTP ${response.status}`)
+  }
+  return await response.json()
+}
+
 /** 模型目录缓存，带 TTL 与并发去重（同一时刻只发一次上游请求）。 */
 export class ModelCatalog {
   private models: GatewayModel[] | undefined

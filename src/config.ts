@@ -7,8 +7,14 @@
  *  2. **默认值** —— 本文件的 {@link DEFAULT_CONFIG}。
  *
  * 注意：本插件**不使用** settings 文件里的用户层配置（网关自身的 config.json
- * 才是权威）。这里注册的 settings namespace 只为让模型设置页有合法的
- * `settingsNs` 地址，避免 `deriveKeyRef(provider)` 崩溃，见 `index.ts`。
+ * 才是权威）。它做的是**反向**的事：把网关 `/v1/models` 的目录写成
+ * `llm-pi-ai.providers.<providerName>` 那一份**可编辑**的 provider 配置
+ * （settings API 的 `mutate`），见 `provider-config.ts` 与 `index.ts`。
+ *
+ * ⚠️ 本文件的 {@link Config} **刻意不含 volatile 字段**。`dsh-settings.describe()`
+ * 只暴露带 volatile 字段的条目，而「设置 → 模型 → 供应商」按条目 id 渲染；本插件
+ * 的条目一旦带 volatile 字段，页面上就会多出**第二个**（本插件的）provider 行 ——
+ * 正是这次要消除的那个。要新增配置项，请照旧保持非 volatile。
  *
  * @module dsh-workbuddy2api/config
  */
@@ -116,6 +122,47 @@ export interface GatewayPluginConfig {
   autoDownloadBinary: boolean
   /** 登录默认使用的 realm；为空则在 `/wb2api-setup` 里询问（或要求显式传参）。 */
   defaultRealm: string
+  /**
+   * 插件要照看的 `llm-pi-ai` provider 名字（`providers.<name>` 的那个键）。
+   *
+   * **默认 `workbuddy`，与管理员手写块同名，不可随意更改** ——
+   * `subagent-router` 的多条路由把 `agent_provider: workbuddy` 写死，
+   * 改名等于把 5 条路由指向一个不存在的 provider。
+   */
+  providerName: string
+  /**
+   * 目标 settings namespace（**同时是 profile 条目 id**）。为空则运行时探测。
+   *
+   * 探测方式：`settings.describe()` 的每个条目都带一份 volatile 表单 schema，
+   * 取其中根级 `providers` 字段类型为 `dict` 的那一个。之所以不写死
+   * `llm-pi-ai`：条目 id 由 profile 组合决定，dev 构建里可能是
+   * `include:llm-pi-ai`。
+   */
+  providerNamespace: string
+  /**
+   * 写路径安全网的备份目录。**为空则自动推导**为
+   * `<dsh home>/wb2api-write-backups`（即 `~/.dsh/wb2api-write-backups`）。
+   *
+   * 之所以默认落在 `home` 而不是 profile 目录里：profile patch 就在
+   * `~/.dsh/profiles/<name>/` 下，备份只有落在它**之外**，才不会被同一次故障
+   * 连同正本一起毁掉（PROJECT.md §0「写配置铁律」第 ① 条）。
+   *
+   * 只有在你确实想把备份放到别处（比如另一个盘）时才需要改这一项。
+   */
+  writeBackupDir: string
+  /**
+   * 是否注册插件**自带**的 `workbuddy2api` 路由（适配器 + 可配置 provider 目录）。
+   *
+   * **默认 false** —— 自带路由是「代码注册的运行时路由」，在「设置 → 模型」里
+   * 永远不可编辑（`dsh-client-ui-settings-models` 只认 `llm-deepseek` 与
+   * `llm-pi-ai` 两个 namespace），启用它就会让供应商列表里多出第二个、且改不动
+   * 的条目，同时它的模型目录会绕过操作员在设置页做的筛选。
+   *
+   * 置 true 可回退到 0.3.x 的旧行为（自带适配器、目录直接来自 `/v1/models`、
+   * 模型页不出现 route 行），此时**不会**再生成 provider 配置 —— 两者互斥，
+   * 否则同一个 provider 名字会被注册两次（`DUPLICATE_ADAPTER`）。
+   */
+  registerOwnProvider: boolean
 }
 
 export const DEFAULT_CONFIG: GatewayPluginConfig = {
@@ -139,6 +186,10 @@ export const DEFAULT_CONFIG: GatewayPluginConfig = {
   binaryReleaseBase: '',
   autoDownloadBinary: false,
   defaultRealm: '',
+  providerName: 'workbuddy',
+  providerNamespace: '',
+  writeBackupDir: '',
+  registerOwnProvider: false,
 }
 
 /**
@@ -173,6 +224,10 @@ export const Config: AnySchema = Schema.object({
   binaryReleaseBase: Schema.string().default(DEFAULT_CONFIG.binaryReleaseBase),
   autoDownloadBinary: Schema.boolean().default(DEFAULT_CONFIG.autoDownloadBinary),
   defaultRealm: Schema.string().default(DEFAULT_CONFIG.defaultRealm),
+  providerName: Schema.string().default(DEFAULT_CONFIG.providerName),
+  providerNamespace: Schema.string().default(DEFAULT_CONFIG.providerNamespace),
+  writeBackupDir: Schema.string().default(DEFAULT_CONFIG.writeBackupDir),
+  registerOwnProvider: Schema.boolean().default(DEFAULT_CONFIG.registerOwnProvider),
 }) as unknown as AnySchema
 
 /**
@@ -192,6 +247,12 @@ export function resolveConfig(raw: Partial<GatewayPluginConfig> | undefined): Ga
   if (!Number.isFinite(merged.listenPort) || merged.listenPort <= 0) merged.listenPort = DEFAULT_CONFIG.listenPort
   // defaultRealm 只认两个合法值；其余（含默认空串）归一为「未指定」，由命令层询问用户。
   if (merged.defaultRealm !== 'cn' && merged.defaultRealm !== 'global') merged.defaultRealm = ''
+  // providerName 是 `providers.<name>` 的键：空串是个合法的 YAML 键名但语义上是笔误，
+  // 归一回默认名，避免生成一个谁都引用不到的 provider。
+  if (typeof merged.providerName !== 'string' || merged.providerName.trim().length === 0) {
+    merged.providerName = DEFAULT_CONFIG.providerName
+  }
+  if (typeof merged.providerNamespace !== 'string') merged.providerNamespace = ''
   return merged
 }
 
