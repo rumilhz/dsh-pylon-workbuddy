@@ -27,6 +27,7 @@ import {
   isLoopbackPortHop,
   pickCheckinAccount,
   registerPanelRoutes,
+  renderCheckinTrace,
   ROUTE_PATHS,
   stripRoutePrefix,
   type PanelApi,
@@ -152,6 +153,9 @@ function makeDeps(gateway: FakeGateway, overrides: Partial<PanelApiDeps> = {}): 
     providerFacts: async () => ({ exists: true, ns: 'llm-pi-ai', modelCount: 46 }),
     lastOffered: () => 48,
     rebuild: async () => {
+      throw new Error('不该在 panel 路径上被调用')
+    },
+    resetRebuild: async () => {
       throw new Error('不该在 panel 路径上被调用')
     },
     checkin: async () => {
@@ -343,6 +347,106 @@ describe('POST <prefix>/action { action: "rebuild" }', () => {
   })
 })
 
+/* ── action：rebuild + reset（完全重建）────────────────────────────────────── */
+
+describe('POST <prefix>/action { action: "rebuild", reset: true } —— 完全重建', () => {
+  /** 一次完全重建的典型结果：原来 6 个手写模型 → 网关目录 48 个。 */
+  const resetOutcome = {
+    kind: 'reset' as const,
+    ns: 'llm-pi-ai',
+    keptModels: 6,
+    writtenModels: ['cn:hy3', 'cn:hy4', 'cn:text-only'],
+    addedModels: ['cn:hy4', 'cn:text-only'],
+    droppedModels: ['cn:hand-written-1', 'cn:hand-written-2', 'cn:hand-written-3'],
+    offeredModels: ['cn:hy3', 'cn:hy4', 'cn:text-only'],
+    backupPath: 'C:/backups/x.yml',
+    notes: [],
+  }
+
+  it('★ reset:true 走**另一条**路径（resetRebuild），不是只增不删那条', async () => {
+    const gateway = fakeGateway()
+    let rebuilt = 0
+    let reset = 0
+    const body = await createPanelApi(makeDeps(gateway, {
+      rebuild: async () => { rebuilt += 1; throw new Error('不该走到只增不删那条路') },
+      resetRebuild: async () => { reset += 1; return resetOutcome },
+    })).action({ action: 'rebuild', reset: true })
+    expect(reset).toBe(1)
+    expect(rebuilt).toBe(0)
+    expect(body.ok).toBe(true)
+    expect(body.detail).toContain('整份覆盖')
+  })
+
+  it('★ 丢掉的 id 必须点名报出来（0.4.0 的承诺）', async () => {
+    const body = await createPanelApi(makeDeps(fakeGateway(), {
+      resetRebuild: async () => resetOutcome,
+    })).action({ action: 'rebuild', reset: true })
+    expect(body).toMatchObject({
+      written: ['cn:hy3', 'cn:hy4', 'cn:text-only'],
+      writtenCount: 3,
+      writtenModels: 3,
+      writtenModelIds: ['cn:hy3', 'cn:hy4', 'cn:text-only'],
+      addedCount: 2,
+      droppedCount: 3,
+      dropped: ['cn:hand-written-1', 'cn:hand-written-2', 'cn:hand-written-3'],
+      droppedModels: 3,
+      droppedModelIds: ['cn:hand-written-1', 'cn:hand-written-2', 'cn:hand-written-3'],
+      modelCount: 3,
+    })
+    expect(String(body.detail)).toContain('丢掉 3 个')
+  })
+
+  it('🔴 不带 reset ⇒ 走的仍是只增不删那条路（默认行为一个字不变）', async () => {
+    const gateway = fakeGateway()
+    let rebuilt = 0
+    let reset = 0
+    const body = await createPanelApi(makeDeps(gateway, {
+      rebuild: async () => {
+        rebuilt += 1
+        return { kind: 'rebuilt', ns: 'llm-pi-ai', addedModels: [], keptModels: 6, offeredModels: [], notes: [] }
+      },
+      resetRebuild: async () => { reset += 1; return resetOutcome },
+    })).action({ action: 'rebuild' })
+    expect(rebuilt).toBe(1)
+    expect(reset).toBe(0)
+    // 只增不删的回执里**不应该**出现 dropped/written 这些覆盖语义的字段。
+    expect(body.dropped).toBeUndefined()
+    expect(body.written).toBeUndefined()
+  })
+
+  it('reset 之外的假值（reset:false / "true" / 1）都不触发覆盖', async () => {
+    for (const value of [false, 'true', 1, null, undefined]) {
+      let reset = 0
+      await createPanelApi(makeDeps(fakeGateway(), {
+        rebuild: async () => ({ kind: 'rebuilt', ns: 'llm-pi-ai', addedModels: [], keptModels: 6, offeredModels: [], notes: [] }),
+        resetRebuild: async () => { reset += 1; return resetOutcome },
+      })).action({ action: 'rebuild', reset: value })
+      expect(reset).toBe(0)
+    }
+  })
+
+  it('完全重建失败 / 被回滚 ⇒ ok:false，且 detail 说清是哪一种', async () => {
+    const failed = await createPanelApi(makeDeps(fakeGateway(), {
+      resetRebuild: async () => ({ kind: 'failed', reason: 'write-failed', detail: '磁盘只读', notes: [] }),
+    })).action({ action: 'rebuild', reset: true })
+    expect(failed.ok).toBe(false)
+    expect(String(failed.detail)).toContain('磁盘只读')
+    const rolledBack = await createPanelApi(makeDeps(fakeGateway(), {
+      resetRebuild: async () => ({
+        kind: 'rolled-back',
+        ns: 'llm-pi-ai',
+        reasons: ['模型数从 48 掉到 0'],
+        backupPath: 'C:/backups/x.yml',
+        recovery: '已盖回',
+        manualBlock: '',
+        notes: [],
+      }),
+    })).action({ action: 'rebuild', reset: true })
+    expect(rolledBack.ok).toBe(false)
+    expect(String(rolledBack.detail)).toContain('已回滚')
+  })
+})
+
 /* ── action：checkin ─────────────────────────────────────────────────────── */
 
 describe('POST <prefix>/action { action: "checkin" }', () => {
@@ -352,7 +456,7 @@ describe('POST <prefix>/action { action: "checkin" }', () => {
     const base = makeDeps(gateway, {
       checkin: async () => {
         checkins += 1
-        return { attempted: true, ok: true, detail: '成功 {"credit":50}' }
+        return { attempted: true, ok: true, status: 'ok', detail: '成功 {"credit":50}' }
       },
     })
     const api = createPanelApi(base)
@@ -364,15 +468,28 @@ describe('POST <prefix>/action { action: "checkin" }', () => {
 
     const body = await api.action({ action: 'checkin' })
     expect(checkins).toBe(1)
-    expect(body).toEqual({ ok: true, attempted: true, detail: '成功 {"credit":50}' })
+    expect(body).toEqual({ ok: true, attempted: true, status: 'ok', already: false, detail: '成功 {"credit":50}' })
+  })
+
+  it('★「今天已签到」⇒ ok:true + status:already + already:true（卡片显示 ✅，不是 ❌）', async () => {
+    const body = await createPanelApi(makeDeps(fakeGateway(), {
+      checkin: async () => ({
+        attempted: true,
+        ok: true,
+        status: 'already',
+        detail: '今天已签过（幂等成功，本次没有新增签到）：上游说「今天已签到，请明天再来」',
+      }),
+    })).action({ action: 'checkin' })
+    expect(body).toMatchObject({ ok: true, attempted: true, status: 'already', already: true })
+    expect(String(body.detail)).toContain('幂等成功')
   })
 
   it('没有 CN 账号 ⇒ attempted:false（一个上游请求都不会发）', async () => {
     const gateway = fakeGateway()
     const body = await createPanelApi(makeDeps(gateway, {
-      checkin: async () => ({ attempted: false, ok: false, detail: '没有启用的 CN 账号 —— 未发请求' }),
+      checkin: async () => ({ attempted: false, ok: false, status: 'not-attempted', detail: '没有启用的 CN 账号 —— 未发请求' }),
     })).action({ action: 'checkin' })
-    expect(body).toMatchObject({ ok: false, attempted: false })
+    expect(body).toMatchObject({ ok: false, attempted: false, status: 'not-attempted', already: false })
   })
 
   it('pickCheckinAccount 只认**启用**的 CN 账号', () => {
@@ -414,14 +531,47 @@ describe('POST <prefix>/action { action: "checkin" }', () => {
     expect(outcome.attempted).toBe(false)
   })
 
-  it('上游拒绝 ⇒ attempted:true + ok:false，且不抛（签到失败不能连累调用方）', async () => {
+  it('上游拒绝（真失败）⇒ attempted:true + ok:false + status:failed，且不抛', async () => {
     const outcome = await requestDailyCheckin({
       realm: 'cn',
       credential: { accessToken: 'tok', domain: 'copilot.tencent.com' },
       identity: { uid: 'u', enterpriseId: '' },
-      fetchImpl: async () => new Response(JSON.stringify({ code: 10001, msg: '今天已签到' }), { status: 400 }),
+      fetchImpl: async () => new Response(JSON.stringify({ code: 50001, msg: '系统繁忙' }), { status: 500 }),
     })
-    expect(outcome).toEqual({ attempted: true, ok: false, detail: '今天已签到' })
+    expect(outcome).toEqual({ attempted: true, ok: false, status: 'failed', detail: '系统繁忙' })
+  })
+
+  it('★「今天已签到」（真机实录 HTTP 400 + code 10001）⇒ ok:true + status:already', async () => {
+    const outcome = await requestDailyCheckin({
+      realm: 'cn',
+      credential: { accessToken: 'tok', domain: 'copilot.tencent.com' },
+      identity: { uid: 'u', enterpriseId: '' },
+      fetchImpl: async () => new Response(JSON.stringify({ code: 10001, msg: '今天已签到，请明天再来' }), { status: 400 }),
+    })
+    expect(outcome).toMatchObject({ attempted: true, ok: true, status: 'already' })
+    expect(outcome.detail).toContain('幂等成功')
+  })
+
+  it('renderCheckinTrace：三态与 detail 都落进那一行（2026-10-15 缺的就是它）', () => {
+    const line = renderCheckinTrace('cn', {
+      attempted: true,
+      ok: true,
+      status: 'already',
+      detail: '今天已签过（幂等成功，本次没有新增签到）：上游说「今天已签到，请明天再来」',
+    })
+    expect(line).toBe(
+      'api: checkin realm=cn attempted=true ok=true status=already '
+      + 'detail=今天已签过（幂等成功，本次没有新增签到）：上游说「今天已签到，请明天再来」',
+    )
+    // 真失败也要能一眼分辨：status 不同、detail 是上游原话。
+    expect(renderCheckinTrace('cn', { attempted: true, ok: false, status: 'failed', detail: '系统繁忙' }))
+      .toContain('status=failed detail=系统繁忙')
+    // 换行会被压成空格（这一行必须能被逐行读取）。
+    expect(renderCheckinTrace('cn', { attempted: true, ok: false, status: 'failed', detail: 'a\nb' }))
+      .toContain('detail=a b')
+    // 「根本没发」也说得清清楚楚。
+    expect(renderCheckinTrace('global', { attempted: false, ok: false, status: 'not-attempted', detail: '没有签到端点' }))
+      .toContain('attempted=false ok=false status=not-attempted')
   })
 
   it('readAuthFile：缺 uid / 缺 accessToken / 不是 JSON ⇒ undefined（不拿半份凭证去签到）', () => {

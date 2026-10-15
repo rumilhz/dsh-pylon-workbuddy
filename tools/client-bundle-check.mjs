@@ -23,9 +23,11 @@
  *       second request; the failure sentence names each path with its own status.
  *   [7] The card RENDERS all four states (loading / error / empty / ready) with the
  *       server's own words on screen, and never a bare `undefined`/`NaN`.
- *   [8] The two dangerous buttons are gated: neither fires on mount, 签到 fires only
- *       from a click, 重建清单 explains "只增不删" in its confirm and sends nothing
- *       when declined, and 测试模型 refuses to request without an explicit
+ *   [8] The dangerous buttons are gated: none fires on mount, 签到 fires only from a
+ *       click, 重建清单 explains "只增不删" in its confirm and sends nothing when
+ *       declined, 完全重建 (the DESTRUCTIVE one) states its cost in its own label and
+ *       in its confirm, sends `{action:"rebuild", reset:true}` only after acceptance
+ *       and lists the dropped ids — and 测试模型 refuses to request without an explicit
  *       confirmation and then sends `confirm: true`.
  *   [9] The pure formatters survive degenerate input (the "server answered something
  *       unexpected" paths) without throwing or printing a ghost.
@@ -405,6 +407,10 @@ has('[ready] the tombstone comparison is stated', readyText, '墓碑比实际多
 has('[ready] checkin.note sits next to the button', readyText, '签到直连上游，会改变账号状态')
 has('[ready] the test button says it costs credits', readyText, '测试模型（会花额度）')
 has('[ready] the rebuild result is on screen', readyText, '新增 2 个 · 保留 46 个')
+// The destructive button's OWN LABEL must state the cost (a user should not have to
+// press it to find out), and the first-run dead end must be explained on screen.
+has('[ready] the destructive button states its cost in its label', readyText, '会覆盖你在模型页做的筛选')
+has('[ready] the first-run dead end is explained next to the additive button', readyText, '故意一个都不加')
 // loading / error / empty
 clean('[loading] the initial view-model renders', I.WorkbuddyCardView(I.emptyState()), '读取中…')
 clean('[error] the server detail is shown verbatim', I.WorkbuddyCardView({ panel: { phase: 'error', detail: '路由没有注册' } }), '路由没有注册')
@@ -415,7 +421,7 @@ clean('[ready] a bare payload renders', I.WorkbuddyCardView({ panel: I.panelView
 eq('a bare payload invents no zero', I.numText(undefined), '?')
 
 /* ────────────────── [8] the two dangerous buttons ────────────────── */
-section('[8] mount, 签到, 重建清单, 测试模型')
+section('[8] mount, 签到, 重建清单, 完全重建, 测试模型')
 calls.length = 0
 responder = () => json({ ok: true })
 // The component itself must not request anything when it is merely RENDERED.
@@ -452,6 +458,35 @@ eq('重建清单 sends exactly one POST', calls.length, 1)
 eq('重建清单 body', calls[0].body, JSON.stringify({ action: 'rebuild' }))
 eq('重建清单 reports the add-new-only result', rebuilt.detail, '新增 1 个 · 保留 46 个')
 eq('重建清单 lists the added ids', rebuilt.added, ['m-new'])
+// A server-side "I added nothing on purpose" (no tombstone record) must reach the
+// screen — otherwise the button just looks broken on first use.
+calls.length = 0
+responder = () => json({ ok: true, added: [], keptCount: 6, modelCount: 6, holdReason: '没有墓碑记录', hint: '首次使用时它故意一个都不加，请用「完全重建」' })
+const held = await I.actRebuild(() => true)
+eq('重建清单 keeps the server hint', held.hint, '首次使用时它故意一个都不加，请用「完全重建」')
+has('[ready] the hint is rendered', renderText(I.WorkbuddyCardView({ panel: readyView, rebuild: held })), '故意一个都不加')
+// 完全重建: this is the DESTRUCTIVE one — declined ⇒ nothing is sent; accepted ⇒
+// exactly one POST that carries `reset:true` (the flag the host keys the overwrite on).
+calls.length = 0
+confirmCalls.length = 0
+const resetDeclined = await I.actReset(() => false)
+eq('declined 完全重建 sends nothing', calls.length, 0)
+eq('declined 完全重建 stays idle', resetDeclined.phase, 'idle')
+calls.length = 0
+confirmCalls.length = 0
+responder = () => json({ ok: true, writtenCount: 48, addedCount: 42, droppedCount: 2, written: ['m-a', 'm-b'], dropped: ['m-gone-1', 'm-gone-2'] })
+const resetDone = await I.actReset((question) => {
+  confirmCalls.push(question)
+  return true
+})
+eq('完全重建 asks once', confirmCalls.length, 1)
+has('完全重建 names the cost in the dialog', confirmCalls[0], '会覆盖你在模型页做的筛选')
+has('完全重建 says deleted models come back', confirmCalls[0], '你删掉的会回来')
+eq('完全重建 sends exactly one POST', calls.length, 1)
+eq('完全重建 body carries reset:true', calls[0].body, JSON.stringify({ action: 'rebuild', reset: true }))
+eq('完全重建 reports write/add/drop counts', resetDone.detail, '写入 48 个 · 新增 42 个 · 丢掉 2 个')
+eq('完全重建 lists the dropped ids', resetDone.dropped, ['m-gone-1', 'm-gone-2'])
+has('[ready] the dropped ids are rendered', renderText(I.WorkbuddyCardView({ panel: readyView, reset: resetDone })), '丢掉：m-gone-1、m-gone-2')
 // 测试模型: no confirmation ⇒ NO request; confirmed ⇒ confirm:true in the body.
 calls.length = 0
 const refused = await I.actTest({})

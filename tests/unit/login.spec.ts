@@ -18,13 +18,17 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   buildAuthFile,
+  CHECKIN_ALREADY_CODE,
+  classifyCheckinResponse,
   inferRealm,
+  isAlreadyCheckinMessage,
   LOGIN_USER_AGENT,
   LoginClient,
   LoginPendingError,
   loginHeaders,
   parseRealmArg,
   realmEndpoints,
+  requestDailyCheckin,
   resolveRealmInput,
   writeAuthFile,
 } from '../../src/login.js'
@@ -233,7 +237,10 @@ describe('LoginClient', () => {
     const upstream = fakeUpstream({ checkin: { status: 400, body: { code: 10001, msg: '今天已签到' } } })
     const client = new LoginClient(upstream.fetchImpl)
     const message = await client.checkin('cn', { accessToken: 't', refreshToken: 'r', expiresIn: 1, domain: 'copilot.tencent.com' }, { uid: 'u', enterpriseId: 'e', nickname: 'n' })
-    expect(message).toBe('今天已签到')
+    // ★ 2026-10-15 的真机实录：上游对「今天第二次签到」回 HTTP 400 + code 10001。
+    //   登录回执那一行必须把它说成**幂等成功**，而不是原样抛一句"今天已签到"让人以为失败了。
+    expect(message).toContain('幂等成功')
+    expect(message).toContain('今天已签到')
     expect(upstream.requests.some(request => request.url.includes('/daily-checkin'))).toBe(true)
   })
 
@@ -255,6 +262,113 @@ describe('LoginClient', () => {
     const message = await client.checkin('global', { accessToken: 't', refreshToken: 'r', expiresIn: 1, domain: 'www.workbuddy.ai' }, { uid: 'u', enterpriseId: '', nickname: 'n' })
     expect(message).toBeUndefined()
     expect(upstream.requests).toHaveLength(0)
+  })
+})
+
+/**
+ * 签到的**三态**判定。
+ *
+ * 这一组钉住的是 2026-10-15 真机上暴露的那个 bug：网关自己的调度器
+ * （`checkin_hours` 默认 `[9,21]`）在 9:00 已经签过，用户 10 点手点卡片时上游回
+ * `HTTP 400 {"code":10001,"msg":"今天已签到，请明天再来"}` —— 那是**幂等成功**，
+ * 老代码却把它报成 ❌。
+ *
+ * 两个方向都要钉：已签到不能被当成失败，**真失败也不能被吞成已签**。
+ */
+describe('每日签到：三态判定（真成功 / 今天已签 / 真失败）', () => {
+  /** 一次签到调用，上游按给定应答回复（并记下发了几个请求）。 */
+  async function checkin(status: number, body: unknown): Promise<{ outcome: Awaited<ReturnType<typeof requestDailyCheckin>>; sent: number }> {
+    let sent = 0
+    const outcome = await requestDailyCheckin({
+      realm: 'cn',
+      credential: { accessToken: 'tok', domain: 'copilot.tencent.com' },
+      identity: { uid: 'oneid_186', enterpriseId: 'ent-1' },
+      fetchImpl: async () => {
+        sent += 1
+        return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+      },
+    })
+    return { outcome, sent }
+  }
+
+  it('① 真成功：code=0 ⇒ ok:true / status=ok', async () => {
+    const { outcome, sent } = await checkin(200, { code: 0, data: { credit: 110 } })
+    expect(sent).toBe(1)
+    expect(outcome).toMatchObject({ attempted: true, ok: true, status: 'ok' })
+    expect(outcome.detail).toContain('110')
+  })
+
+  it('② ★「今天已签到」是幂等成功（真机实录：HTTP 400 + code=10001）—— 绝不能被当成失败', async () => {
+    const { outcome, sent } = await checkin(400, { code: CHECKIN_ALREADY_CODE, msg: '今天已签到，请明天再来' })
+    expect(sent).toBe(1)
+    // ★ 三态的核心断言：ok 是 true（卡片显示 ✅），status 说清「本次没有新增签到」。
+    expect(outcome).toMatchObject({ attempted: true, ok: true, status: 'already' })
+    expect(outcome.status).not.toBe('failed')
+    expect(outcome.detail).toContain('幂等成功')
+    // 上游原话要引出来（用户可能已经看过它），但前面必须有我们自己的定性。
+    expect(outcome.detail).toContain('今天已签到，请明天再来')
+  })
+
+  it('③ 文案兜底：code 变了/没了，msg 里明确说「已领取」照样算已签', async () => {
+    const noCode = await checkin(400, { msg: '今日已领取，请勿重复操作' })
+    expect(noCode.outcome).toMatchObject({ attempted: true, ok: true, status: 'already' })
+    const otherCode = await checkin(400, { code: 40001, msg: '今天已经签到过了' })
+    expect(otherCode.outcome).toMatchObject({ ok: true, status: 'already' })
+  })
+
+  it('④ ★ 真失败不会被吞成「已签」：只有明确说「已签到/已领取」的才算', async () => {
+    // HTTP 500 + 上游自己的错误码 + 一句与签到无关的失败文案。
+    const busy = await checkin(500, { code: 50001, msg: '系统繁忙，请稍后重试' })
+    expect(busy.outcome).toMatchObject({ attempted: true, ok: false, status: 'failed' })
+    expect(busy.outcome.detail).toBe('系统繁忙，请稍后重试')
+    // 文案里出现「签到」但**没有**说「已签到」⇒ 仍然是失败（模糊匹配会在这里出错）。
+    const failed = await checkin(400, { code: 40003, msg: '签到失败：活动未开始' })
+    expect(failed.outcome).toMatchObject({ ok: false, status: 'failed' })
+    // 语义词也不能放宽到「已签」两个字（"已签名"之类必须仍是失败）。
+    expect(isAlreadyCheckinMessage('签名已提交')).toBe(false)
+  })
+
+  it('⑤ code 优先于文案：code=0 就是成功，msg 里出现「已签到」也不改判', () => {
+    expect(classifyCheckinResponse(0, '今天已签到')).toBe('ok')
+    expect(classifyCheckinResponse(undefined, '今天已签到')).toBe('already')
+    expect(classifyCheckinResponse(CHECKIN_ALREADY_CODE, '')).toBe('already')
+    expect(classifyCheckinResponse(undefined, undefined)).toBe('failed')
+    expect(classifyCheckinResponse(500, '内部错误')).toBe('failed')
+  })
+
+  it('⑥ 根本没发请求（global）⇒ attempted:false / status=not-attempted，且失败不算数', async () => {
+    let sent = 0
+    const outcome = await requestDailyCheckin({
+      realm: 'global',
+      credential: { accessToken: 'tok', domain: 'www.workbuddy.ai' },
+      identity: { uid: 'u', enterpriseId: '' },
+      fetchImpl: async () => { sent += 1; return new Response('{}') },
+    })
+    expect(sent).toBe(0)
+    expect(outcome).toMatchObject({ attempted: false, ok: false, status: 'not-attempted' })
+    // 「没发请求」不该被说成「签到失败」：它是另一个问题。
+    expect(outcome.status).not.toBe('failed')
+  })
+
+  it('⑦ 网络层异常 ⇒ attempted:true / failed（发了但没打通）', async () => {
+    const outcome = await requestDailyCheckin({
+      realm: 'cn',
+      credential: { accessToken: 'tok', domain: 'copilot.tencent.com' },
+      identity: { uid: 'u', enterpriseId: '' },
+      fetchImpl: async () => { throw new Error('ECONNRESET') },
+    })
+    expect(outcome).toMatchObject({ attempted: true, ok: false, status: 'failed' })
+    expect(outcome.detail).toContain('ECONNRESET')
+  })
+
+  it('⑧ 非 JSON 应答 ⇒ failed 且带上 HTTP 码（不猜内容）', async () => {
+    const outcome = await requestDailyCheckin({
+      realm: 'cn',
+      credential: { accessToken: 'tok', domain: 'copilot.tencent.com' },
+      identity: { uid: 'u', enterpriseId: '' },
+      fetchImpl: async () => new Response('<html>502 Bad Gateway</html>', { status: 502 }),
+    })
+    expect(outcome).toMatchObject({ attempted: true, ok: false, status: 'failed', detail: 'HTTP 502' })
   })
 })
 

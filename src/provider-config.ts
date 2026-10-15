@@ -281,6 +281,24 @@ export interface SeedDeps {
    */
   overwrite?: boolean
   /**
+   * **完全重建**：显式要求「以网关目录为准整份覆盖」（CLI 的 `--rebuild --reset`、
+   * 卡片上的次级按钮「完全重建（会覆盖筛选）」）。
+   *
+   * 与 `overwrite` 的关系：`reset: true` **本身就意味着「存在也要动」**，因此它隐含
+   * `overwrite`（接线漏了一半时不会静默变成「什么都不做」）。两者都由**操作员当场敲下**。
+   * 它们的代价完全不同，所以是两个开关而不是一个布尔：
+   *
+   * · `overwrite`（只增不删）—— 你筛过的清单一个都不动，只补网关新增的；
+   * · `overwrite + reset`（整份覆盖）—— **忽略墓碑**，把模型清单整份换成网关目录：
+   *   你删掉的会回来，你手工加的会被丢掉（丢掉哪些会在结果里点名报出来）。
+   *
+   * 覆盖成功后墓碑被**重置**为「网关目录里的全部 id」—— 从那一刻起「只增不删」
+   * 又有了准确的记忆（而不是继续拿一份已经和配置对不上的旧账本当判据）。
+   *
+   * 缺省（`undefined` / `false`）时行为与没有这个字段时**逐字一致**：只增不删。
+   */
+  reset?: boolean
+  /**
    * 读「上次提供过哪些模型 id」（墓碑集合）。
    *
    * · `undefined` 返回值 —— **没有记录**（文件不存在 / 读坏了 / 从来没写过）。
@@ -383,6 +401,33 @@ export type SeedOutcome =
     /** 墓碑没能写回时的说明；provider 配置的写入结果不受影响。 */
     stateWarning?: string
   }
+  /**
+   * **完全重建**（`--rebuild --reset`）：忽略墓碑，以网关目录为准整份覆盖。
+   *
+   * 与 `rebuilt` 分开是刻意的 —— 这两件事的**代价**完全不同：`rebuilt` 只增不删
+   * （用户筛过的清单一个都不动），`reset` 会把用户筛掉的模型全带回来、把用户手工加的
+   * 丢掉。返回值里必须点名**丢掉了哪些 id**，否则"已覆盖"三个字等于让用户自己去对账。
+   */
+  | {
+    kind: 'reset'
+    ns: string
+    /** **写入前**配置里已有的模型个数。★ 数字，不是数组（渲染层要的是「原来 N 个」）。 */
+    keptModels: number
+    /** 本次真正写进去的全部 id（= 网关当前目录，保序）。 */
+    writtenModels: string[]
+    /** 目录里有、原来配置里没有的 id（它同样是 `writtenModels` 的子集）。 */
+    addedModels: string[]
+    /** ★ 原来配置里有、这次被覆盖掉的 id —— 0.4.0 承诺要报出来的就是它。 */
+    droppedModels: string[]
+    /** 覆盖后立起的新墓碑 = 网关目录里的全部 id。 */
+    offeredModels: string[]
+    /** 备份落点（整份覆盖一定写了，所以一定有）。 */
+    backupPath?: string
+    /** 本次写进去的那些模型的字段说明。 */
+    notes: ProviderModelNote[]
+    /** 墓碑没能写回时的说明；provider 配置的写入结果不受影响。 */
+    stateWarning?: string
+  }
   | { kind: 'skipped'; reason: 'no-settings-service' | 'no-namespace'; detail: string }
   /**
    * 写入**返回了成功**，但读回校验判定不可信，配置已按备份恢复。
@@ -405,7 +450,7 @@ export type SeedOutcome =
   }
   | {
     kind: 'failed'
-    reason: 'gateway-unreachable' | 'write-failed'
+    reason: 'gateway-unreachable' | 'write-failed' | 'empty-catalog'
     detail: string
     /** 可直接粘贴进 profile `cordis.patch.yml` 的 YAML；拿不到目录时为 undefined。 */
     manualBlock?: string
@@ -999,6 +1044,10 @@ async function commitOffered(deps: SeedDeps, ids: string[]): Promise<string | un
 const NO_BASELINE_HOLD = '没有上一次的「提供过哪些」记录，无法区分「网关新增」与「你删掉的」'
   + ' —— 本次**一个都不加**（加错就是复活你删掉的模型）。'
   + '本次已把网关当前目录记为基线，之后的刷新只会补真正新增的。'
+  // ★ 出口必须写在这里：用户看到「一个都不加」时的下一个问题一定是「那我怎么把网关
+  //   那份完整目录拉进来」。没有这一句，这条保守路径在第一次使用时就是一个死胡同。
+  + '（要以网关目录为准**整份拉进来**，用 /wb2api-provider --rebuild --reset —— '
+  + '它会覆盖你在模型页做的筛选，并把丢掉的 id 逐个报出来。）'
 
 /**
  * 保证「设置 → 模型」里那份可编辑 provider 存在。**默认存在即返回，绝不改写。**
@@ -1011,6 +1060,9 @@ const NO_BASELINE_HOLD = '没有上一次的「提供过哪些」记录，无法
  *  4. `deps.overwrite === true`（`/wb2api-provider --rebuild`）且已存在 → 拉网关目录，
  *     但走**只增不删**：`added = 目录 − 配置里已有的 − 墓碑里的`，写回
  *     「现有条目原样 + added」；`added` 为空时**一个字节都不写**；
+ *  4b. `deps.overwrite === true && deps.reset === true`（`--rebuild --reset`，卡片上的
+ *     「完全重建」）且已存在 → **忽略墓碑**、以网关目录为准整份覆盖（`reset`），
+ *     并把丢掉的 id 逐个报出来；覆盖成功后墓碑重置为「网关目录的全部 id」；
  *  5. **写前**：`guard.snapshot()` 把整份 patch 备份到 profile 之外；**备份不了就不写**；
  *  6. `mutate` 写入 `['providers', <name>]`；
  *  7. **写后**：`guard.verify()` 独立读回核对条目数；判定不可信 → `guard.rollback()`
@@ -1068,8 +1120,8 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
   const existing = namespace.providers[deps.providerName]
   const alreadyExists = providerExists(namespace, deps.providerName)
   // ★ 核心不变量：provider 已存在就返回，连 `/v1/models` 都不拉。
-  //   只有操作员显式要求刷新（`/wb2api-provider --rebuild`）才越过它。
-  if (alreadyExists && deps.overwrite !== true) {
+  //   只有操作员显式要求刷新（`/wb2api-provider --rebuild`）或整份覆盖（`--reset`）才越过它。
+  if (alreadyExists && deps.overwrite !== true && deps.reset !== true) {
     // present 在有记录时**续**墓碑（只增不减：用户删过的 id 绝不能被这一轮抹掉，
     // 否则下一次 --rebuild 就会把它加回来）。
     //
@@ -1112,6 +1164,123 @@ export async function seedEditableProvider(deps: SeedDeps): Promise<SeedOutcome>
   }
 
   const build = buildProviderProfile(entries, { apiKeyEnv: deps.apiKeyEnv, baseURL: deps.baseURL })
+
+  // ── 分支 0：完全重建（`--rebuild --reset`）—— 忽略墓碑，以网关目录为准整份覆盖 ────
+  //
+  // 这条路的**全部意义**是给「第一次用」留一个出口：provider 是手写的（或在这个版本
+  // 之前就存在的）时候墓碑里没有记录，只增不删那条路按设计**一个都不加**，于是用户
+  // 没有任何办法把网关那份完整目录拉进来。
+  //
+  // 刻意放在只增不删那段**之前**，且一旦 `deps.reset` 为真就绝不再看墓碑一眼：
+  // 在这条路上墓碑是被**重置**的对象，不是判据。混进下面那段逻辑里，两个判据迟早会被
+  // 后人搅在一起 —— 而它们的代价完全不同（一个不删东西，一个会删）。
+  if (alreadyExists && deps.reset === true) {
+    const keptIds = modelIds(existing)
+    const keptSet = new Set(keptIds)
+    const writtenModels = build.profile.models
+    const writtenIds = writtenModels.map(model => model.id)
+    const writtenSet = new Set(writtenIds)
+    // 丢掉的 = 原来有、网关目录里没有的（保序，操作员要照着这个名单对账）。
+    const droppedIds = keptIds.filter(id => !writtenSet.has(id))
+    const addedIds = writtenIds.filter(id => !keptSet.has(id))
+    const resetProfile = { ...build.profile, models: writtenModels }
+    const resetManualBlock = renderProviderProfileYaml(deps.providerName, resetProfile, PASTE_INDENT)
+    // 整份覆盖是**显式**要写，所以不做「没有变化就不写」那套优化：操作员敲的就是「覆盖」。
+
+    // ★ 空目录**拒绝覆盖**。这是这条破坏性路径上唯一能"把用户清单清空"的形态：
+    //   网关拉起来了但目录是空的（半启动、账号全挂、API 变了）时，若照写，用户的
+    //   46 个模型会变成 0 个 —— 而墓碑同时被重置为空，连"只增不删"的记忆也没了。
+    //   只增不删那条路在这种情形下天然安全（added 为空 ⇒ 一个字节都不写），
+    //   这里必须显式挡住。
+    if (writtenIds.length === 0) {
+      return {
+        kind: 'failed',
+        reason: 'empty-catalog',
+        detail: `网关目录是空的（0 个模型），已拒绝整份覆盖 —— 那会把现有 ${keptIds.length} 个模型清空、`
+          + '并把墓碑重置为空。请先用 /wb2api-status 确认网关状态；'
+          + '只想补网关新增的（不删任何东西）用 /wb2api-provider --rebuild。',
+        notes: [],
+      }
+    }
+
+    if (deps.guard === undefined) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: '没有接线写路径安全网（WriteGuard），已放弃写入 —— 见 PROJECT.md §0「写配置铁律」。'
+          + '插件不在没有退路的情况下改用户配置。',
+        manualBlock: resetManualBlock,
+        notes: build.notes,
+      }
+    }
+    let resetBaseline: WriteBaseline
+    try {
+      resetBaseline = await deps.guard.snapshot()
+    } catch (error) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: `写入前备份失败，已放弃写入：${error instanceof Error ? error.message : String(error)}`,
+        manualBlock: resetManualBlock,
+        notes: build.notes,
+      }
+    }
+
+    try {
+      await settings.mutate(
+        namespace.ns,
+        [{ op: 'set', path: ['providers', deps.providerName], value: resetProfile }],
+        namespace.revision,
+      )
+    } catch (error) {
+      return {
+        kind: 'failed',
+        reason: 'write-failed',
+        detail: error instanceof Error ? error.message : String(error),
+        manualBlock: resetManualBlock,
+        notes: build.notes,
+      }
+    }
+
+    const resetVerdict = await deps.guard.verify(resetBaseline, { modelCount: writtenIds.length })
+    if (resetVerdict.ok) {
+      // ★ 墓碑被**重置**为「网关目录里的全部 id」：从这一刻起「只增不删」又有了准确的
+      //   记忆。继续拿一份和配置已经对不上的旧账本当判据，才是真危险。
+      const offeredModels = [...writtenIds]
+      const stateWarning = await commitOffered(deps, offeredModels)
+      return {
+        kind: 'reset',
+        ns: namespace.ns,
+        keptModels: keptIds.length,
+        writtenModels: writtenIds,
+        addedModels: addedIds,
+        droppedModels: droppedIds,
+        offeredModels,
+        backupPath: resetBaseline.backupPath,
+        notes: build.notes,
+        ...(stateWarning === undefined ? {} : { stateWarning }),
+      }
+    }
+    let resetRecovery: string
+    try {
+      await deps.guard.rollback(resetBaseline)
+      resetRecovery = `已从备份整份盖回（${resetBaseline.backupPath}），配置与写入前一致。`
+        + 'DSH 会热加载 profile patch；若没生效，重启一次即可。'
+    } catch (error) {
+      resetRecovery = `⚠ 回滚失败：${error instanceof Error ? error.message : String(error)}`
+        + `\n请手工把 ${resetBaseline.backupPath} 覆盖回 profile 的 cordis.patch.yml。`
+    }
+    // ★ 回滚分支**不写墓碑**：这次写入没被采信，墓碑就不能替它背书。
+    return {
+      kind: 'rolled-back',
+      ns: namespace.ns,
+      reasons: resetVerdict.reasons,
+      backupPath: resetBaseline.backupPath,
+      recovery: resetRecovery,
+      manualBlock: resetManualBlock,
+      notes: build.notes,
+    }
+  }
 
   // ── 分支 1：只增不删（`--rebuild` 且 provider 已存在） ─────────────────────
   // 判据是「**从没提供过**」，不是「目录里有、条目里没有」：

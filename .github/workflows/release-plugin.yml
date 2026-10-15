@@ -61,6 +61,14 @@ jobs:
           test -f lib/gateway-binary.js
           test -f lib/login.js
           test -f lib/setup.js
+          # 设置卡片的两半：宿主路由 + 浏览器 bundle。
+          # 缺了它们插件照样能跑（卡片不出现），所以【必须】在这里挡住，
+          # 否则会发出一个「没有卡片的版本」而 CI 全绿。
+          test -f lib/api.js
+          test -f lib/client.js
+          # 墓碑状态与启动轨迹：缺了会静默降级，同样值得挡住。
+          test -f lib/plugin-state.js
+          test -f lib/boot-trace.js
 
       - name: Pack tarball
         run: |
@@ -71,15 +79,33 @@ jobs:
           # 报 ENOENT 退出 254）。本机之所以没暴露，只是因为本地 dist/ 早就在了。
           mkdir -p dist
           npm pack --ignore-scripts --pack-destination dist
+          # ★ 另外产出一份【不带版本号】的副本。
+          #
+          # 为什么：插件市场上架要求 tarball 的 URL 稳定，而
+          # `releases/latest/download/<asset>` 是按【资产文件名】取最新 release 的 ——
+          # 文件名里带版本号的话，下一次发版资产改名，旧链接会【静默 404】
+          # （不是报错，是下载不到）。所以固定名那份专供 latest/download 使用；
+          # 带版本号那份留给用户按版本下载。
+          #
+          # rm 是必需的：本机重复跑时 glob 会匹配到上一轮的副本，`cp a b dest` 报错。
+          rm -f dist/plugin-latest.tgz
+          cp dist/*.tgz dist/plugin-latest.tgz
           ls -l dist
 
       - name: Assert tarball contents
         run: |
           # 安装包必须自带 cordis.patch.yml（插件靠它挂进 profile 的 bundle 层），
           # 且不应把源码/测试打进去。
-          tar -tzf dist/*.tgz | sort | tee /tmp/contents.txt
+          #
+          # 注意 dist/ 现在有两个 .tgz（固定名 + 带版本号），内容相同 —— 取其一检查。
+          PKG_TGZ="$(ls dist/*.tgz | head -1)"
+          echo "检查 $PKG_TGZ"
+          tar -tzf "$PKG_TGZ" | sort | tee /tmp/contents.txt
           grep -q 'package/cordis.patch.yml' /tmp/contents.txt
           grep -q 'package/lib/index.js' /tmp/contents.txt
+          # 设置卡片的浏览器半边必须打进包 —— 否则发出去的是「没有卡片的版本」。
+          grep -q 'package/lib/client.js' /tmp/contents.txt
+          grep -q 'package/lib/api.js' /tmp/contents.txt
           if grep -q 'package/src/' /tmp/contents.txt; then
             echo "::error::tarball 里不应包含 src/"; exit 1
           fi

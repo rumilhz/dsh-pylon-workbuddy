@@ -32,6 +32,7 @@
 import { gatewayOrigin } from './config.js'
 import { maskNickname } from './nickname.js'
 import type { AuthAccount } from './accounts.js'
+import type { CheckinStatus } from './login.js'
 import type { SeedOutcome } from './provider-config.js'
 
 /**
@@ -178,8 +179,26 @@ export type ActionBody = { ok: boolean; detail?: string } & Record<string, unkno
 export interface CheckinActionOutcome {
   /** 真的发了那个 POST 没有。`false` 时 `detail` 说明为什么没发。 */
   attempted: boolean
+  /** **幂等口径**的「今天签上了吗」：`status === 'ok' || status === 'already'` 为 true。 */
   ok: boolean
+  /** 三态 + 「根本没发」；见 `login.ts` 的 `CheckinStatus`。 */
+  status: CheckinStatus
   detail: string
+}
+
+/**
+ * 签到那一行轨迹（**两条调用路径共用同一份措辞**：卡片手点、`/wb2api-login` 顺手签）。
+ *
+ * ★ 为什么必须带上 `status` 与 `detail`：2026-10-15 的真机 `boot.log` 里只有
+ * `api: checkin realm=cn attempted=true ok=false` —— 光凭这一行分不清「上游真拒了」
+ * 与「今天已经签过了（幂等成功）」，把一个本该 30 秒定位的问题变成了一次专门探针。
+ * 轨迹可以少一行，但不能有一行是**不足以定位问题**的。
+ *
+ * `detail` 里的空白（含换行）压成单个空格：这一行要能被逐行读取。
+ */
+export function renderCheckinTrace(realm: string, outcome: CheckinActionOutcome): string {
+  return `api: checkin realm=${realm} attempted=${String(outcome.attempted)} ok=${String(outcome.ok)}`
+    + ` status=${outcome.status} detail=${outcome.detail.replace(/\s+/g, ' ').trim()}`
 }
 
 /** 测试动作的入参（来自请求体，全部可选）。 */
@@ -211,8 +230,16 @@ export interface PanelApiDeps {
   providerFacts?: () => Promise<{ exists: boolean; ns: string | null; modelCount: number | null } | undefined>
   /** 墓碑里的 id 个数；`undefined` = 没有记录。 */
   lastOffered?: () => number | undefined
-  /** 重建清单（走 `ensureEditableProvider(…, overwrite=true)` 那条路）。 */
+  /** 重建清单（走 `ensureEditableProvider(…, overwrite=true)` 那条路，只增不删）。 */
   rebuild: () => Promise<SeedOutcome>
+  /**
+   * **完全重建**（`--rebuild --reset`）：忽略墓碑，以网关目录为准整份覆盖。
+   *
+   * 与 {@link PanelApiDeps.rebuild} 分开是刻意的。两者的**代价完全不同**：
+   * `rebuild` 只增不删（你筛过的清单一个都不动），`reset` 会把你筛掉的模型全带回来、
+   * 把你手工加的丢掉。挤进一个布尔，卡片就再也说不出「你点的是哪一个」。
+   */
+  resetRebuild: () => Promise<SeedOutcome>
   /** 用户显式触发的签到（直连上游）。 */
   checkin: () => Promise<CheckinActionOutcome>
   /** 轨迹锚点（缺省丢弃）。 */
@@ -478,10 +505,26 @@ export function createPanelApi(deps: PanelApiDeps): PanelApi {
     const name = str(request['action'])
     trace(`api: action=${name ?? '(缺失)'}`)
     try {
-      if (name === 'rebuild') return describeRebuild(await deps.rebuild())
+      if (name === 'rebuild') {
+        // `reset: true` = **完全重建**（忽略墓碑、以网关目录为准整份覆盖）。
+        // ★ 没有这个键时走的是原来那一条路，行为一个字都不变（只增不删）。
+        if (request['reset'] === true) {
+          trace('api: rebuild reset=true（完全重建：忽略墓碑，以网关目录为准整份覆盖）')
+          return describeRebuild(await deps.resetRebuild())
+        }
+        return describeRebuild(await deps.rebuild())
+      }
       if (name === 'checkin') {
         const result = await deps.checkin()
-        return { ok: result.ok, attempted: result.attempted, detail: result.detail }
+        // ★ 四态一起回报：卡片按 `ok` 决定 ✅/❌（「今天已签到」是 ✅），
+        //   按 `status` 才能说出「这次到底有没有新增一次签到」。
+        return {
+          ok: result.ok,
+          attempted: result.attempted,
+          status: result.status,
+          already: result.status === 'already',
+          detail: result.detail,
+        }
       }
       if (name === 'test') return await runTest(deps, fetchImpl, request, trace)
       return {
@@ -536,10 +579,44 @@ function describeRebuild(outcome: SeedOutcome): ActionBody {
         ...rebuildCounts(outcome.addedModels, outcome.keptModels, outcome.offeredModels, outcome.keptModels + outcome.addedModels.length),
         ns: outcome.ns,
         holdReason: outcome.holdReason ?? null,
+        // ★ 「一个都不加」时把**出口**指明白：这不是故障，是刻意的保守；但用户必须有路可走。
+        //   没有这一行，用户看到的就是「按钮点了没反应」——第一次使用时最典型的死角。
+        hint: held
+          ? '首次使用（插件记的「提供过哪些」还没有记录）时，「重建清单」**故意一个都不加**：'
+            + '它分不清哪些是网关新增、哪些是你删掉的，加错就是复活你删掉的模型。'
+            + '要以网关目录为准整份拉进来，用右边的「完全重建（会覆盖筛选）」——它会明说丢掉了哪些 id。'
+          : null,
         detail: held
           ? `未刷新（${outcome.holdReason}）：保留 ${outcome.keptModels} 个，新增 0 个`
           : `保留 ${outcome.keptModels} 个，新增 ${outcome.addedModels.length} 个`
             + `（settings 条目 ${outcome.ns}）`,
+      }
+    }
+    /**
+     * 完全重建（`--rebuild --reset`）：**整份覆盖**，丢掉的那些 id 必须点名报出来。
+     *
+     * 0.4.0 的承诺就是「丢掉了什么都告诉你」—— 只说「已覆盖」等于让用户自己去模型页
+     * 逐个对账。`dropped` / `droppedCount` / `droppedModels` 三个名字都给，理由同
+     * {@link rebuildCounts}：卡片与后端是并行开发的，多给键无害、缺键会让卡片只剩一句话。
+     */
+    case 'reset': {
+      const written = outcome.writtenModels.length
+      return {
+        ok: true,
+        ...rebuildCounts(outcome.addedModels, outcome.keptModels, outcome.offeredModels, written),
+        writtenModels: written,
+        writtenModelIds: outcome.writtenModels,
+        droppedModels: outcome.droppedModels.length,
+        droppedModelIds: outcome.droppedModels,
+        dropped: outcome.droppedModels,
+        droppedCount: outcome.droppedModels.length,
+        written: outcome.writtenModels,
+        writtenCount: written,
+        ns: outcome.ns,
+        holdReason: null,
+        detail: `已按网关目录**整份覆盖**：写入 ${written} 个`
+          + `（新增 ${outcome.addedModels.length} 个，丢掉 ${outcome.droppedModels.length} 个）`
+          + `（settings 条目 ${outcome.ns}）`,
       }
     }
     case 'created':

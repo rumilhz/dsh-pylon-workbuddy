@@ -45,6 +45,7 @@ import {
   createPanelApi,
   pickCheckinAccount,
   registerPanelRoutes,
+  renderCheckinTrace,
   type PanelApiDeps,
   type PanelRouteContext,
 } from './api.js'
@@ -295,6 +296,15 @@ function renderTombstoneTrace(outcome: SeedOutcome): string {
     parts.push(`added=${outcome.addedModels.length}`, `kept=${outcome.keptModels}`)
     if (outcome.holdReason !== undefined) parts.push(`held=${outcome.holdReason}`)
   }
+  if (outcome.kind === 'reset') {
+    // 完全重建：**丢掉的 id 个数**与新增同样重要 —— 这一行是事后对账的锚点。
+    parts.push(
+      `written=${outcome.writtenModels.length}`,
+      `added=${outcome.addedModels.length}`,
+      `dropped=${outcome.droppedModels.length}`,
+      `kept=${outcome.keptModels}`,
+    )
+  }
   if ('offeredModels' in outcome) parts.push(`offered=${outcome.offeredModels.length}`)
   // `undefined` ⇒ 「没有记录」（不是「记录是空的」）；`[]` ⇒ 「知道，一个都没提供过」。
   parts.push(`tombstoneRead=${lastTombstone.read === undefined ? 'none' : lastTombstone.read.length}`)
@@ -360,6 +370,8 @@ function createTombstoneWiring(
  * @param config - 插件配置。
  * @param resolveApiKey - 取网关凭据。
  * @param overwrite - 已存在时是否去网关对一遍清单（只增不删）；默认 false（绝不改写）。
+ * @param reset - 已存在时是否**整份覆盖**（忽略墓碑，以网关目录为准）；默认 false。
+ *   它隐含 overwrite —— 接线只给了一半时不会静默退化成「什么都不做」。
  * @returns 本次的动作与说明。
  */
 async function ensureEditableProvider(
@@ -367,12 +379,17 @@ async function ensureEditableProvider(
   config: GatewayPluginConfig,
   resolveApiKey: () => Promise<string | undefined>,
   overwrite = false,
+  reset = false,
 ): Promise<SeedOutcome> {
   // 本轮开始：清掉上一轮的墓碑读数，免得上一次的结果（或「一次都没读」）被这一次
   // 渲染成好像是这次读到的。轨迹可以少一行，但不能有一行是**错的**。
   lastTombstone.read = undefined
   lastTombstone.wrote = undefined
-  trace(`seed: start（overwrite=${String(overwrite)} —— ${overwrite ? '--rebuild：存在也会去对目录，只增不删' : '仅缺失时创建，存在即不碰'}）`)
+  // 三个开关的组合必须一行读完：这一行是事后回答「用户当时到底敲了什么/点了哪个按钮」
+  // 的唯一依据（完全重建与只增不删的代价完全不同）。
+  trace(`seed: start（overwrite=${String(overwrite)} reset=${String(reset)} —— ${reset
+    ? '--rebuild --reset：存在也会去对目录，并**整份覆盖**（忽略墓碑）'
+    : overwrite ? '--rebuild：存在也会去对目录，只增不删' : '仅缺失时创建，存在即不碰'}）`)
   await waitForLoaderSettled(ctx)
   // settings 是「能不能自动写 provider」的开关：它缺失时整步降级成「打印手工块」。
   // 这一行把那次降级从「provider 没出现」这种结果，变回「settings 没拿到」这个原因。
@@ -387,6 +404,7 @@ async function ensureEditableProvider(
     apiKeyEnv: config.apiKeyRef,
     baseURL: config.baseURL,
     overwrite,
+    reset,
     guard: createWriteGuard(ctx, config),
     ...createTombstoneWiring(ctx, config),
     fetchEntries: async () => {
@@ -412,6 +430,25 @@ async function ensureEditableProvider(
   trace(renderTombstoneTrace(outcome))
   trace(`seed: ${outcome.kind}${'ns' in outcome ? ` ns=${outcome.ns}` : ''}`)
   return outcome
+}
+
+/**
+ * `/wb2api-provider` 的参数解析。
+ *
+ * 抽成纯函数是因为**三个开关的代价完全不同**，而它们的拼写只差几个字符：
+ * `--create` 从不改写、`--rebuild` 只增不删、`--rebuild --reset` 整份覆盖。
+ * 让它在单测里可断言，比在注释里叮嘱「小心别写错」可靠得多。
+ *
+ * `--reset` **隐含 `--rebuild`**：只敲 `--reset` 的人显然要的是覆盖 ——
+ * 少打一个词不该变成「什么都没发生」（静默降级在这种破坏性操作上是最坏的选择）。
+ *
+ * @param rawInput - 命令的原始参数串。
+ * @returns 三个开关各自是否出现。
+ */
+export function parseProviderCommandArgs(rawInput: string): { create: boolean; rebuild: boolean; reset: boolean } {
+  const has = (flag: string): boolean => new RegExp(`(^|\\s)${flag}(\\s|$)`).test(rawInput)
+  const reset = has('--reset')
+  return { create: has('--create'), rebuild: has('--rebuild') || reset, reset }
 }
 
 /** 手工粘贴块的抬头（说清贴到哪一层，粘错层级不会报错、只会被静默忽略）。 */
@@ -467,6 +504,10 @@ function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): s
         // 没有记录时**故意什么都不加**：加错就是复活用户删掉的模型。
         lines.push(`⚠ 没有刷新 provider "${name}"（settings 条目 "${outcome.ns}"）：${outcome.holdReason}`)
         lines.push(`本次保留 ${outcome.keptModels} 个模型，新增 0 个。`)
+        // ★ 出口：不把这条保守路径变成死胡同。第一次使用时用户唯一能走的就是它。
+        lines.push('要以网关目录为准**整份拉进来**，跑 /wb2api-provider --rebuild --reset'
+          + '（或点卡片上的「完全重建（会覆盖筛选）」）—— 它会覆盖你在模型页做的筛选，'
+          + '并把丢掉的 id 逐个报出来。')
       } else if (outcome.addedModels.length === 0) {
         lines.push(`provider "${name}"（settings 条目 "${outcome.ns}"）已是最新：`
           + `保留 ${outcome.keptModels} 个模型，新增 0 个 —— 网关没有你还没见过的模型。`)
@@ -482,6 +523,37 @@ function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): s
         : `写前已备份到 profile 之外（${outcome.backupPath}），写后核对过条目数；核对不通过会自动回滚并说明。`)
       if (outcome.notes.length > 0) {
         lines.push('新增的模型里有字段被略过（插件不猜数值，请自行核对）：')
+        lines.push(...renderProviderNotes(outcome.notes))
+      }
+      return lines.join('\n') + renderStateWarning(outcome.stateWarning)
+    }
+    /**
+     * 完全重建（`--rebuild --reset` / 卡片上的「完全重建」）。
+     *
+     * 这个分支的措辞要点：**先说代价，再说结果**。它和 `rebuilt` 长得像，但一个不删东西、
+     * 一个会删 —— 用户看到的必须是「原来 N 个 → 现在 M 个，丢掉了这些 id」，
+     * 而不是一句"已覆盖"。
+     */
+    case 'reset': {
+      const lines = [
+        `已按网关目录**整份覆盖** provider "${name}"（settings 条目 "${outcome.ns}"）：`
+        + `原来 ${outcome.keptModels} 个 → 现在 ${outcome.writtenModels.length} 个`
+        + `（新增 ${outcome.addedModels.length} 个，丢掉 ${outcome.droppedModels.length} 个）。`,
+        '★ 这次是**完全重建**：你在「设置 → 模型」里做过的筛选已经被覆盖，'
+        + '网关目录里的模型全部回到清单里。',
+      ]
+      if (outcome.addedModels.length > 0) lines.push(`新增：${outcome.addedModels.join(', ')}`)
+      lines.push(outcome.droppedModels.length > 0
+        // 「丢掉了哪些」是 0.4.0 就承诺要报出来的东西 —— 只说个数不够。
+        ? `丢掉（不再在网关目录里）：${outcome.droppedModels.join(', ')}`
+        : '丢掉：无（原来清单里的 id 网关目录里都还在）')
+      lines.push(`墓碑已重置为网关目录里的全部 ${outcome.offeredModels.length} 个 id`
+        + ' —— 从这一刻起 /wb2api-provider --rebuild 又只补网关**真正新增**的。')
+      lines.push(outcome.backupPath === undefined
+        ? '⚠ 本次没有走安全网（没有接线），没有备份。'
+        : `写前已备份到 profile 之外（${outcome.backupPath}），写后核对过条目数；核对不通过会自动回滚并说明。`)
+      if (outcome.notes.length > 0) {
+        lines.push('写进去的模型里有字段被略过（插件不猜数值，请自行核对）：')
         lines.push(...renderProviderNotes(outcome.notes))
       }
       return lines.join('\n') + renderStateWarning(outcome.stateWarning)
@@ -510,7 +582,11 @@ function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): s
     }
     case 'failed': {
       const lines: string[] = []
-      if (outcome.reason === 'gateway-unreachable') {
+      if (outcome.reason === 'empty-catalog') {
+        // 这条与「网关不可达」是两件事：网关答了，只是答案是空的。措辞里必须说清
+        // 「我拒绝了什么」—— 否则用户只会看到"失败"，然后手工把清单清空。
+        lines.push(`⚠ 没有覆盖 provider "${name}"：${outcome.detail}`)
+      } else if (outcome.reason === 'gateway-unreachable') {
         lines.push(`⚠ provider "${name}" 不存在，且拉不到网关模型目录：${outcome.detail}`)
         lines.push(`⚠ 此时 ${'`'}agent_provider: ${name}${'`'} 的多条路由指向一个不存在的 provider。`
           + '插件不会替你猜数值 —— 请确认网关已启动（/wb2api-start）后重跑 /wb2api-provider --create。')
@@ -1080,24 +1156,31 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
 
   ctx.commands.register({
     name: 'wb2api-provider',
-    description: '查看可编辑 provider 与网关目录的差异（只读）；--create 缺失时创建；--rebuild 只增不删地补上网关新增的',
-    input: { hint: '[--create|--rebuild]' },
+    description: '查看可编辑 provider 与网关目录的差异（只读）；--create 缺失时创建；--rebuild 只增不删地补上网关新增的；--rebuild --reset 以网关目录为准整份覆盖（会覆盖你在模型页做的筛选）',
+    input: { hint: '[--create|--rebuild|--rebuild --reset]' },
     handler: async ({ rawInput }): Promise<CommandResult> => {
       try {
-        const wantsCreate = /(^|\s)--create(\s|$)/.test(rawInput)
-        const wantsRebuild = /(^|\s)--rebuild(\s|$)/.test(rawInput)
+        const { create: wantsCreate, rebuild: wantsRebuild, reset: wantsReset } = parseProviderCommandArgs(rawInput)
         if ((wantsCreate || wantsRebuild) && !config.registerOwnProvider) {
-          // `--rebuild` 与 `--create` 的唯一区别是**已存在时也去对一遍目录**。
+          // 三个开关的**代价完全不同**，而它们只差几个字符：
+          //   --create —— 仅缺失时创建，从不改写；--rebuild —— 只增不删；
+          //   --rebuild --reset —— 整份覆盖（你筛过的清单会被覆盖）。
           // 这一行要在调 `ensureEditableProvider` **之前**打：那一步会写盘，
-          // 万一它卡住或抛错，「用户敲的到底是 --rebuild 还是 --create」必须已经落盘。
-          trace(wantsRebuild
-            ? 'command: /wb2api-provider --rebuild（只增不删，读墓碑）'
-            : 'command: /wb2api-provider --create（仅缺失时创建）')
-          const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver(), wantsRebuild)
-          const header = wantsRebuild
-            ? '（显式 --rebuild：**只增不删** —— 只补网关新增的模型，你在模型页删掉的不会复活。'
-              + '写入带安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。）\n'
-            : '（显式 --create：仅在 provider 缺失时创建，从不改写已有模型清单）\n'
+          // 万一它卡住或抛错，「用户敲的到底是哪个」必须已经落盘。
+          trace(wantsReset
+            ? 'command: /wb2api-provider --rebuild --reset（完全重建：忽略墓碑，以网关目录为准整份覆盖）'
+            : wantsRebuild
+              ? 'command: /wb2api-provider --rebuild（只增不删，读墓碑）'
+              : 'command: /wb2api-provider --create（仅缺失时创建）')
+          const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver(), wantsRebuild, wantsReset)
+          const header = wantsReset
+            ? '（显式 --rebuild --reset：**完全重建** —— 忽略墓碑，以网关目录为准整份覆盖模型清单。'
+              + '★ 代价：你在「设置 → 模型」里做过的筛选会被覆盖（你删掉的会回来、你手工加的会丢掉，'
+              + '丢掉的 id 会在下面逐个列出）。写入带安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。）\n'
+            : wantsRebuild
+              ? '（显式 --rebuild：**只增不删** —— 只补网关新增的模型，你在模型页删掉的不会复活。'
+                + '写入带安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。）\n'
+              : '（显式 --create：仅在 provider 缺失时创建，从不改写已有模型清单）\n'
           return {
             kind: outcome.kind === 'failed' ? 'error' : 'success',
             text: header + renderSeedOutcome(outcome, config),
@@ -1162,7 +1245,13 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           + '\n· /wb2api-provider --create  —— 仅在 provider 缺失时创建，绝不改写已有清单。'
           + '\n· /wb2api-provider --rebuild —— **只增不删**：只补网关新增的模型，'
           + '你在模型页删掉的不会复活（依据是插件自己记的「迄今提供过哪些 id」）。'
-          + '\n两者都带写路径安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。'
+          + '★ 插件**没有**这条记忆时（第一次用、或状态文件被删过）它**故意一个都不加** ——'
+          + '分不清「网关新增」与「你删掉的」，加错就是复活你删掉的模型。'
+          + '\n· /wb2api-provider --rebuild --reset —— **完全重建**：忽略那条记忆，'
+          + '以网关目录为准**整份覆盖**模型清单，并把丢掉的 id 逐个报出来。'
+          + '★ 代价：你在「设置 → 模型」里做过的筛选会被覆盖（删掉的会回来、手工加的会丢掉）。'
+          + '第一次使用想把网关那份完整目录拉进来，用的就是这一条。'
+          + '\n三条都带写路径安全网：写前备份到 profile 之外、写后核对条目数、不对就自动回滚。'
         return { kind: 'success', text: body }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
@@ -1270,7 +1359,12 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           throw new Error('上游返回的账号信息里没有 uid，无法确定凭证文件名。')
         }
         const file = writeAuthFile(authDir, buildAuthFile(result))
-        const checkin = await loginClient.checkin(realm, result.token, result.account)
+        // ★ 顺手签那一次的**三态**：`status` 与 `detail` 都要落进轨迹。
+        //   「今天已签到」是幂等成功（多半是网关自己的调度器已经签过了），
+        //   在这一行里必须与「上游真的拒了」区分得开 —— 卡片那条路同理。
+        const checkinOutcome = await loginClient.checkinOutcome(realm, result.token, result.account)
+        trace(renderCheckinTrace(realm, checkinOutcome))
+        const checkin = checkinOutcome.attempted ? checkinOutcome.detail : undefined
         // 重启失败不当作登录失败：凭证已经落盘，失败原因照实说明即可。
         let restartLine = '网关未由本插件托管（subprocess 不可用），请手工重启网关以加载新账号。'
         if (supervisor !== undefined) {
@@ -1727,23 +1821,43 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     },
     // 与 `/wb2api-provider --rebuild` 走**同一条路径**（overwrite=true ⇒ 只增不删）。
     rebuild: () => ensureEditableProvider(ctx, config, () => apiKeyResolver(), true),
+    // ★ 完全重建：overwrite + reset ⇒ 忽略墓碑、以网关目录为准整份覆盖（卡片上的次级按钮）。
+    //   与上面那条**必须是两次不同的调用**：一个不删东西，一个会删。
+    resetRebuild: () => ensureEditableProvider(ctx, config, () => apiKeyResolver(), true, true),
     // ★ 签到：**只有用户点了**才会走到这里（没有任何定时器/启动钩子会调它）。
     checkin: async () => {
       const account = pickCheckinAccount(accountStore.list())
       if (account === undefined) {
-        return { attempted: false, ok: false, detail: '没有启用的 CN 账号 —— 未发请求（上游只实测了 CN 的签到端点）。' }
+        return {
+          attempted: false,
+          ok: false,
+          status: 'not-attempted' as const,
+          detail: '没有启用的 CN 账号 —— 未发请求（上游只实测了 CN 的签到端点）。',
+        }
       }
       const document = readAuthFile(account.file)
       if (document === undefined) {
-        return { attempted: false, ok: false, detail: `凭证文件不可用（缺 uid 或 accessToken）：${basename(account.file)}` }
+        return {
+          attempted: false,
+          ok: false,
+          status: 'not-attempted' as const,
+          detail: `凭证文件不可用（缺 uid 或 accessToken）：${basename(account.file)}`,
+        }
       }
       const outcome = await requestDailyCheckin({
         realm: document.auth.realm,
         credential: { accessToken: document.auth.accessToken, domain: document.auth.domain },
         identity: { uid: document.account.uid, enterpriseId: document.account.enterpriseId },
       })
-      trace(`api: checkin realm=${document.auth.realm} attempted=${String(outcome.attempted)} ok=${String(outcome.ok)}`)
-      return { attempted: outcome.attempted, ok: outcome.ok, detail: outcome.detail }
+      // ★ 轨迹带上三态与 detail：只记 `ok=false` 的话，「今天已签到（幂等成功）」与
+      //   「上游真的拒了」在 boot.log 里长得一模一样（2026-10-15 就卡在这里）。
+      trace(renderCheckinTrace(document.auth.realm, outcome))
+      return {
+        attempted: outcome.attempted,
+        ok: outcome.ok,
+        status: outcome.status,
+        detail: outcome.detail,
+      }
     },
     trace,
   }

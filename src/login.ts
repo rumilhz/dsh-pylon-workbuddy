@@ -162,18 +162,105 @@ export interface CheckinIdentity {
 }
 
 /**
+ * 一次签到**请求**的结果态。三态 + 一种「根本没发」。
+ *
+ * · `'ok'` —— 上游真的记了一次签到（`code === 0`）。
+ * · `'already'` —— **幂等成功**：上游明确说「今天已经签过了」，本次没有新增签到。
+ *   它不是失败：用户今天的目标（签上）本来就已达成（多半是网关自己的调度器
+ *   `checkin_hours` 默认 `[9,21]` 已经签过了）。
+ * · `'failed'` —— 真失败：网络错误 / 非 JSON / 上游明确拒绝且不是「已签到」。
+ * · `'not-attempted'` —— 我们**一个请求都没发**（global 没有该端点，或账号/凭据不可用）。
+ *
+ * 为什么不能只有「成功/失败」：2026-10-15 的真机实录里，用户点签到得到的是
+ * `HTTP 400 {"code":10001,"msg":"今天已签到，请明天再来"}` —— 那是**幂等成功**，
+ * 却被老代码显示成 ❌。见 {@link classifyCheckinResponse}。
+ */
+export type CheckinStatus = 'ok' | 'already' | 'failed' | 'not-attempted'
+
+/**
  * 一次「每日签到」调用的结果。
  *
- * `attempted` 与 `ok` 是**两个不同的问题**，刻意分开：
- *   · `attempted: false` —— 我们**一个请求都没发**（global 没有该端点，或拿不到凭据）；
- *   · `attempted: true, ok: false` —— 发了，上游拒绝了（例如「今天已签到」）。
+ * `attempted` 与 `status` 是**两个不同的问题**，刻意分开：
+ *   · `attempted: false`（`status: 'not-attempted'`）—— 一个请求都没发；
+ *   · `attempted: true` —— 发了，`status` 说清是哪一种结局。
  * 设置卡片要能显示「真的点了才发请求」，所以这两件事不能挤进一个布尔。
  */
 export interface CheckinOutcome {
   attempted: boolean
+  /**
+   * **幂等口径**的「今天签上了吗」：`status === 'ok' || status === 'already'` 为 true。
+   *
+   * 保留这个字段是因为卡片与 `/wb2api-login` 都按它决定「显示 ✅ 还是 ❌」——
+   * 「今天已签到」必须显示 ✅，所以它不能是 false。要区分「真新增」与「本来就签过」，
+   * 读 {@link CheckinOutcome.status}。
+   */
   ok: boolean
+  status: CheckinStatus
   /** 给人看的一行；语义与登录流程里那份回执逐字一致。 */
   detail: string
+}
+
+/**
+ * 上游「今天已经签过了」的业务码。
+ *
+ * **实测出处**（2026-10-15，一次性探针直打上游 daily-checkin）：
+ * `HTTP 400` + `{"code":10001,"msg":"今天已签到，请明天再来","requestId":"…"}`。
+ * 注意 HTTP 400 在这里**不代表失败** —— 上游对「今天第二次签到」就是这个答复。
+ */
+export const CHECKIN_ALREADY_CODE = 10001
+
+/**
+ * 文案兜底的关键词 —— 上游文案可能变，code 也可能变，但这几个词只有一个意思。
+ *
+ * 刻意**不含**「失败」「错误」这类词，也**不做**模糊匹配：只认明确说了「已经领过了」的，
+ * 否则就会把真失败吞成「已签」（那是这个改动最容易犯的错）。
+ */
+export const CHECKIN_ALREADY_MARKERS = [
+  '已签到',
+  '已经签到',
+  '已领取',
+  'already checked in',
+] as const
+
+/** `msg` 里是否**明确**说了「今天已经签过了」。大小写不敏感；空串返回 false。 */
+export function isAlreadyCheckinMessage(message: string | undefined): boolean {
+  if (message === undefined || message === '') return false
+  const haystack = message.toLowerCase()
+  return CHECKIN_ALREADY_MARKERS.some(marker => haystack.includes(marker.toLowerCase()))
+}
+
+/**
+ * 判定一次签到应答属于哪一态。**code 优先，文案兜底**：
+ *
+ *   1. `code === 0` ⇒ `'ok'`（文案里就算出现「已签到」也只是巧合，不推翻 code）；
+ *   2. `code === 10001` ⇒ `'already'`（上游的「今天已签到」码；msg 变了也认）；
+ *   3. 否则 `msg` 里**明确**说了「已签到 / 已领取」⇒ `'already'`；
+ *   4. 其余（网络层之外的一切）⇒ `'failed'`。
+ *
+ * 顺序是本函数的全部要点：先 code 后文案，且文案那一关只放行明确措辞 ——
+ * 「把真失败也吞成已签」与「把已签报成失败」都是 bug，前者更危险。
+ */
+export function classifyCheckinResponse(
+  code: number | undefined,
+  message: string | undefined,
+): 'ok' | 'already' | 'failed' {
+  if (code === 0) return 'ok'
+  if (code === CHECKIN_ALREADY_CODE) return 'already'
+  if (isAlreadyCheckinMessage(message)) return 'already'
+  return 'failed'
+}
+
+/**
+ * 「今天已签到」那一态给人看的一行。
+ *
+ * 把上游原话**引在括号里**而不是替换掉它：用户可能已经看过上游的原文，
+ * 两句话对得上才不会以为是两种不同的结果。
+ */
+export function alreadyCheckinDetail(message: string | undefined): string {
+  const head = '今天已签过（幂等成功，本次没有新增签到）'
+  return message === undefined || message === ''
+    ? head
+    : `${head}：上游说「${message}」`
 }
 
 /**
@@ -188,6 +275,10 @@ export interface CheckinOutcome {
  *
  * 失败只回报文本、绝不抛：签到失败不该影响登录结果，也不该让设置卡片崩掉。
  *
+ * ★ 「今天已签到」按**幂等成功**回报（`status: 'already'`、`ok: true`）：上游对
+ * 「今天第二次签到」正是这个答复，把它显示成 ❌ 是错的。判定口径见
+ * {@link classifyCheckinResponse}。
+ *
  * @param options - realm、凭据、身份；`fetchImpl` / `timeoutMs` 可注入（测试用）。
  * @returns {@link CheckinOutcome}。
  */
@@ -200,7 +291,12 @@ export async function requestDailyCheckin(options: {
 }): Promise<CheckinOutcome> {
   const endpoints = realmEndpoints(options.realm)
   if (endpoints.checkinBase === undefined) {
-    return { attempted: false, ok: false, detail: '该 realm 没有签到端点（上游只实测了 CN），未发请求。' }
+    return {
+      attempted: false,
+      ok: false,
+      status: 'not-attempted',
+      detail: '该 realm 没有签到端点（上游只实测了 CN），未发请求。',
+    }
   }
   const fetchImpl = options.fetchImpl ?? fetch
   const { credential, identity } = options
@@ -219,11 +315,31 @@ export async function requestDailyCheckin(options: {
       signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
     })
     const body = await response.json().catch(() => undefined) as { code?: number; msg?: string; data?: unknown } | undefined
-    if (body === undefined) return { attempted: true, ok: false, detail: `HTTP ${response.status}` }
-    if (body.code === 0) return { attempted: true, ok: true, detail: `成功 ${JSON.stringify(body.data ?? {}).slice(0, 150)}` }
-    return { attempted: true, ok: false, detail: body.msg ?? `HTTP ${response.status}` }
+    if (body === undefined) {
+      return { attempted: true, ok: false, status: 'failed', detail: `HTTP ${response.status}` }
+    }
+    const status = classifyCheckinResponse(body.code, body.msg)
+    if (status === 'ok') {
+      return {
+        attempted: true,
+        ok: true,
+        status,
+        detail: `成功 ${JSON.stringify(body.data ?? {}).slice(0, 150)}`,
+      }
+    }
+    // ★ 幂等成功：上游说「今天已签到」。`ok: true` 是刻意的 —— 用户今天的目标已达成，
+    //   卡片与登录回执都该显示 ✅；「本次有没有真的新增一次签到」由 status 区分。
+    if (status === 'already') {
+      return { attempted: true, ok: true, status, detail: alreadyCheckinDetail(body.msg) }
+    }
+    return { attempted: true, ok: false, status: 'failed', detail: body.msg ?? `HTTP ${response.status}` }
   } catch (error) {
-    return { attempted: true, ok: false, detail: error instanceof Error ? error.message : String(error) }
+    return {
+      attempted: true,
+      ok: false,
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    }
   }
 }
 
@@ -366,22 +482,33 @@ export class LoginClient {
   }
 
   /**
-   * CN 签到（best-effort）。
+   * CN 签到（best-effort）—— **完整三态**版本。
+   *
+   * 登录流程用这个版本而不是 {@link LoginClient.checkin} 的文本版：它要拿
+   * `status` 去写轨迹（`api: checkin … status=already detail=…`），否则「今天已签到」
+   * 与「上游真的拒了」在 boot.log 里长得一模一样（2026-10-15 就卡在这里）。
    *
    * 完全对齐 `login.sh` 的行为：**失败只提示，绝不影响登录结果**（凭证此时已经拿到，
    * 因为签到失败就让整次登录失败是本末倒置）。global 不签到（上游标注该端点未实测）。
-   *
-   * 实现已经搬到模块级的 {@link requestDailyCheckin}（设置卡片的签到按钮走同一个函数），
-   * 这里只把结果翻译回「一行文本 / 什么都没发」这个旧契约。
    */
-  async checkin(realm: Realm, token: TokenBundle, account: AccountInfo): Promise<string | undefined> {
-    const outcome = await requestDailyCheckin({
+  async checkinOutcome(realm: Realm, token: TokenBundle, account: AccountInfo): Promise<CheckinOutcome> {
+    return await requestDailyCheckin({
       realm,
       credential: { accessToken: token.accessToken, domain: token.domain },
       identity: { uid: account.uid, enterpriseId: account.enterpriseId },
       fetchImpl: this.fetchImpl,
       timeoutMs: this.timeoutMs,
     })
+  }
+
+  /**
+   * CN 签到的**文本契约**（`login.sh` 那一份：一行文本 / 什么都没发）。
+   *
+   * 文本用的是**三态里那一态自己的措辞**，所以「今天已签到（幂等成功）」在这一行里
+   * 也读得出来，不会显示成失败。
+   */
+  async checkin(realm: Realm, token: TokenBundle, account: AccountInfo): Promise<string | undefined> {
+    const outcome = await this.checkinOutcome(realm, token, account)
     return outcome.attempted ? outcome.detail : undefined
   }
 }
