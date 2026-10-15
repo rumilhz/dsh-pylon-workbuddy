@@ -10,6 +10,9 @@
  *  2. **启动 ≠ 可用** —— 网关需要 `auths/*.json` 账号凭证；没有账号时 `/healthz`
  *     即使有响应也可能是 `healthy: 0`。因此探活必须解析 `healthy` / `total`，
  *     而不能只看 HTTP 200。
+ *  3. ★ **「慢」不是「不在」** —— 探活**超时**与**端口无监听**是两件事，必须分开
+ *     （见 {@link ProbeOutcome}）：前者禁止 `spawn`（端口上可能已经有服务，
+ *     再拉一个只会撞端口，然后被记成「进程意外退出」），后者才可以。
  *
  * @module dsh-pylon-workbuddy/gateway-supervisor
  */
@@ -18,7 +21,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { gatewayOrigin, gatewayPort, type GatewayPluginConfig } from './config.js'
-import { defaultRuntimeDir } from './gateway-binary.js'
+import { resolveAuthDir } from './auth-dir.js'
 import { dshHome } from './plugin-state.js'
 
 /** 探活结果。 */
@@ -56,6 +59,13 @@ export interface GatewayStatus {
   restarts: number
   /** 最近一次失败原因。 */
   lastError?: string
+  /**
+   * 最近一次失败的**类别**（只有 `failed` 时才有意义）。
+   *
+   * `lastError` 是给人看的句子，随时可能改字；调用方要按病因改指引就得看这个字段
+   * （就绪度指引：只有「没装 / 没登录」才该指 `/wb2api-setup` 与 `/wb2api-login`）。
+   */
+  lastFailure?: GatewayFailureKind
   /** 子进程 stderr 的尾部（诊断用）。 */
   recentStderr?: string
 }
@@ -89,16 +99,86 @@ export interface GatewaySupervisorOptions {
 }
 
 /**
- * 判断错误是否表示「连接被拒」——即端口上没有服务在监听。
+ * 一次探活的结果。
+ *
+ * ## 为什么是三态而不是「报告 | undefined」
+ *
+ * 「没人听」与「有人听、但它没在预算内回答」在**调用点上后果完全不同**：
+ *
+ * · `no-listener` ⇒ 端口空闲 ⇒ **可以** `spawn`（这是「网关没起来，拉起来」的正常路径）；
+ * · `unreachable`  ⇒ 端口上**可能已经有服务**（正在启动的网关 / 卡住的网关 / 别的程序）
+ *   ⇒ **绝不能** spawn：同端口再 bind 会失败，子进程随即退出，于是
+ *   「网关进程意外退出」+ 退避重启 ×N + `state=failed` —— 而那次误判的起因只是
+ *   **一次超过 `healthTimeoutSeconds` 的往返**。
+ *
+ * 2026-10-15 实测（`tools/_stall-fetch.cjs` 注入停顿）：旧实现把**任何** fetch 异常
+ * 都返回 `undefined`（= 文档里的「端口无监听」），于是给一个**正在应答**的假网关
+ * 又 `spawn` 了一个进程；`statusWithHealth()` 也把在跑的网关报成 `stopped`。
+ */
+export type ProbeOutcome =
+  | { kind: 'ok'; report: HealthReport }
+  | { kind: 'no-listener' }
+  /** 有监听但没回答 / 超时 / 传输失败。`reason` 是给人看的原因（会进 `lastError`）。 */
+  | { kind: 'unreachable'; reason: string }
+
+/**
+ * 失败的**类别**（与给人看的 `lastError` 分开）。
+ *
+ * 就绪度指引要按病因给不同的下一步：端口上有服务却没应答时，打「请先
+ * `/wb2api-setup` / `/wb2api-login`」是**错误指引**（网关可能正在启动，
+ * 重装重登都不会让它变快）。类别是稳定的，句子可以随便改。
+ */
+export type GatewayFailureKind = 'port-unresponsive' | 'port-foreign'
+
+/**
+ * 判断错误是否表示「连接被拒」——即端口上**确实没有**服务在监听。
  *
  * 探活时这是**正常**结果（网关未启动），不是故障。
+ *
+ * ★ 必须收窄到 `ECONNREFUSED` 这一个 code（2026-10-15 修正）：
+ * 旧实现里 `error.name === 'TypeError'` 一条会把**任意** undici `TypeError`
+ * 算成拒连 —— 包括「URL 根本解析不了」（`baseURL` 写错）和别的传输失败。
+ * 实测：`baseURL: 'not-a-url'` 时 `probe()` 返回「端口无监听」，
+ * 于是插件会去拉一个本地网关，再把「配置写错」记成「30 秒内未就绪」。
  */
 function isConnectionRefused(error: unknown): boolean {
-  if (!(error instanceof Error)) return false
-  const code = (error as { cause?: { code?: unknown } }).cause?.code
-  if (code === 'ECONNREFUSED') return true
-  // undici 把连接失败包成 TypeError('fetch failed')，cause 里才带 code。
-  return error.name === 'TypeError' && code === undefined
+  return findErrorCode(error) === 'ECONNREFUSED'
+}
+
+/**
+ * 从错误链里找出第一个 `code`（undici 把底层错误塞在 `cause` 里）。
+ *
+ * 要展开 `AggregateError`：双栈主机（`::1` + `127.0.0.1`）同时连不上时，
+ * fetch 抛的是 `TypeError('fetch failed')`，`cause` 是一个 AggregateError，
+ * 它自己**没有** `code`，code 在 `cause.errors[]` 的每个成员上。
+ */
+function findErrorCode(error: unknown, seen: Set<unknown> = new Set()): string | undefined {
+  if (error === null || typeof error !== 'object' || seen.has(error)) return undefined
+  seen.add(error)
+  const code = (error as { code?: unknown }).code
+  if (typeof code === 'string') return code
+  const nested = (error as { errors?: unknown }).errors
+  if (Array.isArray(nested)) {
+    for (const item of nested) {
+      const found = findErrorCode(item, seen)
+      if (found !== undefined) return found
+    }
+  }
+  return findErrorCode((error as { cause?: unknown }).cause, seen)
+}
+
+/**
+ * 把一次失败的探活翻译成给人看的**原因**。
+ *
+ * 这条兑现的是旧代码里那句没兑现的注释（「超时同样视作不可用，但保留原因供状态命令展示」
+ * —— 当时三个分支都 `return undefined`，原因被整个丢掉）。
+ */
+function describeProbeFailure(error: unknown, url: string, timeoutMs: number): string {
+  if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return `${url} 在 ${timeoutMs}ms 内没有响应（超时）`
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return `${url} 请求失败：${message}`
 }
 
 /** 把一份 `/healthz` 的 JSON 体转成探活报告（2xx 与 503 两条路共用，字段口径只有这一处）。 */
@@ -179,6 +259,16 @@ export class GatewaySupervisor {
   private state: GatewayState = 'stopped'
   private restarts = 0
   private lastError: string | undefined
+  /** 最近一次失败的类别（见 {@link GatewayStatus.lastFailure}）。 */
+  private lastFailure: GatewayFailureKind | undefined
+  /**
+   * 最近一次**探活**失败的原因（探活层，不是进程层）。
+   *
+   * 单独存一份是因为两条通道都要用它：`waitForHealth()` 走满预算后要把它写进
+   * `lastError`（不然用户只看到「未就绪」而不知道是超时还是没人听），
+   * `statusWithHealth()` 要把它透给 `/wb2api-status`。
+   */
+  private lastProbeReason: string | undefined
   private resolvedBinary: string | undefined
   /**
    * 最近一次探活结果。
@@ -323,27 +413,33 @@ export class GatewaySupervisor {
    *   这条形态必须认出来，否则会把「正在跑、只是没账号」误判成「端口被别的程序占用」
    *   或「还没起来」。实测后果见 {@link healthReportFromUnhealthyStatus}。
    *
-   * @returns 探活结果；端口无监听时返回 undefined。
-   * @throws 端口有监听、但 `/healthz` 既不是本网关的 2xx 也不是本网关的 503 时抛错。
+   * 三态结果见 {@link ProbeOutcome}：**超时不是「没人听」**。
+   *
+   * @returns `ok` / `no-listener`（仅 `ECONNREFUSED`）/ `unreachable`（带原因）。
+   * @throws 端口有监听、但 `/healthz` 既不是本网关的 2xx 也不是本网关的 503 时抛错
+   *   ——「端口上是别的程序」是**确定性**结论，不重试、也不降级成 `unreachable`
+   *   （那会把它和「慢」混为一谈，而那正是这次要修的病）。
    */
-  async probe(): Promise<HealthReport | undefined> {
+  async probe(): Promise<ProbeOutcome> {
+    const url = `${this.origin}/healthz`
+    const timeoutMs = this.options.config.healthTimeoutSeconds * 1000
     let response: Response
     try {
-      response = await this.fetchImpl(`${this.origin}/healthz`, {
+      response = await this.fetchImpl(url, {
         method: 'GET',
-        signal: AbortSignal.timeout(this.options.config.healthTimeoutSeconds * 1000),
+        signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (error) {
-      if (isConnectionRefused(error)) return undefined
-      // 超时同样视作"不可用"，但保留原因供状态命令展示。
-      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) return undefined
-      return undefined
+      if (isConnectionRefused(error)) return { kind: 'no-listener' }
+      // 超时 / DNS 失败 / TLS 失败 / URL 写错 …… 一律是「这次没问出来」，
+      // **不是**「没人听」。原因必须带回去（状态命令与失败文案都要用它）。
+      return { kind: 'unreachable', reason: describeProbeFailure(error, url, timeoutMs) }
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => '')
       const report = healthReportFromUnhealthyStatus(response.status, body)
-      if (report !== undefined) return report
+      if (report !== undefined) return { kind: 'ok', report }
       throw new Error(
         `workbuddy2api: ${this.origin} 上有服务在监听，但 /healthz 返回 HTTP ${response.status}`
         + `${body.length > 0 ? `：${body.slice(0, 200)}` : ''}。端口可能被其他程序占用。`,
@@ -357,22 +453,52 @@ export class GatewaySupervisor {
       throw new Error(`workbuddy2api: ${this.origin}/healthz 返回的不是 JSON，端口可能被其他程序占用。`)
     }
 
-    return toHealthReport(raw)
+    return { kind: 'ok', report: toHealthReport(raw) }
+  }
+
+  /**
+   * 启动前的一次「**决定性**」探活：`unreachable` 时重试，直到拿到 ok / no-listener。
+   *
+   * ## 为什么必须重试（而不是一超时就拒绝启动）
+   *
+   * `unreachable` 是**弱**结论：它可能是「端口上有个卡住的服务」，也可能只是这一次
+   * 往返恰好超了预算（dsh 启动时整机在抢 IO、杀软过滤 loopback ……）。
+   *
+   * · 若不重试就拒绝 spawn：一次瞬时停顿会让**本来该起来**的网关起不来 ——
+   *   那是拿「可用性」换「不撞端口」，不划算；
+   * · 若像旧实现那样把它当 `no-listener` 去 spawn：端口上真有服务时，
+   *   子进程 bind 失败 → 记成「意外退出」→ 退避重启 ×N → `state=failed`，
+   *   用户看到的是**假的**失败。
+   *
+   * 重试能把这两种都判对：瞬时停顿会收敛成决定性答案，持续不回答才拒绝 spawn。
+   * 端口上是**别的程序**（probe 抛错）时**不重试** —— 那是决定性结论。
+   */
+  private async probeDecision(attempts = 3, delayMs = 250): Promise<ProbeOutcome> {
+    let last: ProbeOutcome = { kind: 'unreachable', reason: '未执行探活' }
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) await new Promise(resolve => { setTimeout(resolve, delayMs) })
+      last = await this.probe()
+      if (last.kind !== 'unreachable') return last
+    }
+    return last
   }
 
   /**
    * 统计网关实际读取的 `auths/` 目录下的凭证文件数（诊断「网关起来了但没有账号」）。
    *
-   * 目录按网关**真实的工作目录**推导（`workingDir` → `repoPath` → 插件运行目录），
-   * 与 `resolveWorkingDir()` 同源：写死 `repoPath/auths` 会让「自动下载二进制」的用户
-   * 永远看到 0（凭证在运行目录里，而他没配 repoPath）。
+   * ★ 目录口径与 {@link AccountStore.authDir} **同一个来源**（{@link resolveAuthDir}），
+   * 这是 2026-10-15 修掉的第二处误报：
+   *
+   * · 旧实现固定拼 `<基准>/auths`，**不读** `config.json` 的 `auth_dir`；
+   * · 而登录（`/wb2api-login`）与账号切换写的是 `AccountStore.authDir()`，
+   *   它会读 `auth_dir`；
+   * ⇒ 用户把 `auth_dir` 改成 `./creds` 之后，这个数字**永远是 0**，
+   *   而它出现的场合全是**解释为什么没有可用账号**的提示文案 ——
+   *   那句「auths/ 下 0 个凭证文件」会把用户指向一个空的默认目录去排查。
    */
   countAuthFiles(): number {
-    const cwd = this.options.config.workingDir.length > 0
-      ? this.options.config.workingDir
-      : this.options.config.repoPath.length > 0 ? this.options.config.repoPath : defaultRuntimeDir()
     try {
-      const dir = join(cwd, 'auths')
+      const dir = resolveAuthDir(this.options.config)
       if (!existsSync(dir)) return 0
       return readdirSync(dir).filter(name => name.endsWith('.json')).length
     } catch {
@@ -420,29 +546,53 @@ export class GatewaySupervisor {
     this.stopping = false
     this.state = 'starting'
     this.lastError = undefined
+    this.lastFailure = undefined
+    this.lastProbeReason = undefined
 
     // 1. 先探：已有健康网关就直接复用。
+    //
+    // 这里的 try 只包**探活本身**：probe() 抛错 = 端口上是别的程序（决定性结论），
+    // 原样变成 state=failed + 同一条文案（与旧行为逐字一致）。别的分支在下面平铺。
+    let existing: ProbeOutcome
     try {
-      const existing = await this.probe()
-      // 探活期间被 stop() 作废（如 /wb2api-account 正在改名）：不要写任何状态，
-      // 否则会给一个已经决定停掉的网关标上 external。
-      if (stale()) return this.status()
-      if (existing !== undefined) {
-        this.state = 'external'
-        this.options.logger.info(
-          `[workbuddy2api] 复用已在 ${this.origin} 运行的网关（healthy=${existing.healthy}/${existing.total}）`,
-        )
-        // 把刚探到的结果带进返回值：调用方（/wb2api-setup、/wb2api-start、自动启动）
-        // 都靠 status.health 汇报账号可用性，丢掉它就只能显示「运行中」而没有账号数。
-        this.health = existing
-        return this.status()
-      }
+      existing = await this.probeDecision()
     } catch (error) {
       if (stale()) return this.status()
       this.state = 'failed'
+      this.lastFailure = 'port-foreign'
       this.lastError = error instanceof Error ? error.message : String(error)
       throw error
     }
+    // 探活期间被 stop() 作废（如 /wb2api-account 正在改名）：不要写任何状态，
+    // 否则会给一个已经决定停掉的网关标上 external。
+    if (stale()) return this.status()
+
+    if (existing.kind === 'ok') {
+      this.state = 'external'
+      this.options.logger.info(
+        `[workbuddy2api] 复用已在 ${this.origin} 运行的网关（healthy=${existing.report.healthy}/${existing.report.total}）`,
+      )
+      // 把刚探到的结果带进返回值：调用方（/wb2api-setup、/wb2api-start、自动启动）
+      // 都靠 status.health 汇报账号可用性，丢掉它就只能显示「运行中」而没有账号数。
+      this.health = existing.report
+      return this.status()
+    }
+
+    if (existing.kind === 'unreachable') {
+      // ★ 不 spawn：端口上**可能**已经有服务（正在启动的网关 / 卡住的网关 / 别的程序）。
+      //   旧实现把它当「端口无监听」⇒ 又拉一个子进程 ⇒ 同端口 bind 失败 ⇒
+      //   「进程意外退出」+ 退避重启 ×N，而网关其实在跑（2026-10-15 实测 D2）。
+      this.state = 'failed'
+      this.lastFailure = 'port-unresponsive'
+      this.lastError = `workbuddy2api: ${existing.reason}。`
+        + `为免与 ${this.origin} 上可能已存在的服务撞车，本次**不**自动拉起新进程。`
+        + '若那是本网关，它可能正在启动或响应过慢 —— 稍后重试 /wb2api-start；'
+        + '若端口被别的程序占用，请释放该端口，或改插件的 baseURL / listenPort。'
+      this.options.logger.error(`[workbuddy2api] ${this.lastError}`)
+      throw new Error(this.lastError)
+    }
+
+    // existing.kind === 'no-listener'：端口确实没人听，按老路拉起。
 
     // 2. 拉起受管进程。
     const argv0 = await this.resolveBinary()
@@ -472,8 +622,15 @@ export class GatewaySupervisor {
     if (stale()) return this.status()
     if (health === undefined) {
       this.state = 'failed'
-      // 子进程若已退出，watchExit 已经写下更准确的病因（退出码/信号），不要覆盖它。
-      this.lastError ??= `网关已拉起，但 ${this.healthDeadlineMs()}ms 内 /healthz 未就绪`
+      // 子进程若已退出，watchExit 已经写下更准确的病因（退出码/信号），不要覆盖它 ——
+      // 那种情况是「进程崩了」，不是「端口上有个不回答的服务」，类别也不能写错。
+      if (this.lastError === undefined) {
+        // ★ 带上探活层的原因：只说「未就绪」时，「超时」与「没人听」在日志里长得一样，
+        //   而两者的下一步完全不同（前者看网关在忙什么，后者看进程为什么没起来）。
+        this.lastError = `网关已拉起，但 ${this.healthDeadlineMs()}ms 内 /healthz 未就绪`
+          + `${this.lastProbeReason !== undefined ? `（最近一次探活：${this.lastProbeReason}）` : ''}`
+        this.lastFailure = 'port-unresponsive'
+      }
       this.options.logger.error(`[workbuddy2api] ${this.lastError}`)
       return this.status()
     }
@@ -510,7 +667,20 @@ export class GatewaySupervisor {
     const exited = handle.done.then(() => 'exited' as const, () => 'exited' as const)
     while (Date.now() < deadline) {
       const outcome = await Promise.race([
-        this.probe().then(health => health ?? 'unhealthy' as const, () => 'unhealthy' as const),
+        // 探活的三态在这里的含义：
+        //   ok          ⇒ 就绪，返回报告；
+        //   no-listener ⇒ 进程还没 bind 上，继续等（与旧行为一致）；
+        //   unreachable ⇒ 端口在应答但没给出 health（超时/传输失败）⇒ 继续等，
+        //                 并**留下原因**供超时文案使用（旧实现把它和 no-listener 一起吞掉）。
+        // probe() 抛错（端口上是别的程序）与旧行为一致：当作"还没就绪"，继续轮询。
+        this.probe().then(
+          (result): HealthReport | 'unhealthy' => {
+            if (result.kind === 'ok') return result.report
+            this.recordProbeReason(result)
+            return 'unhealthy'
+          },
+          () => 'unhealthy' as const,
+        ),
         exited,
         new Promise<'tick'>(resolve => { setTimeout(() => resolve('tick'), 250) }),
       ])
@@ -522,6 +692,11 @@ export class GatewaySupervisor {
       if (outcome !== 'unhealthy' && outcome !== 'tick') return outcome
     }
     return undefined
+  }
+
+  /** 记下探活层的失败原因（超时/DNS/传输失败），供超时文案与状态命令展示。 */
+  private recordProbeReason(outcome: ProbeOutcome): void {
+    if (outcome.kind === 'unreachable') this.lastProbeReason = outcome.reason
   }
 
   /** 监视子进程退出，按策略自动重启。 */
@@ -610,6 +785,7 @@ export class GatewaySupervisor {
       ...this.resolvedBinary !== undefined ? { binaryPath: this.resolvedBinary } : {},
       ...this.health !== undefined ? { health: this.health } : {},
       ...this.lastError !== undefined ? { lastError: this.lastError } : {},
+      ...this.lastFailure !== undefined ? { lastFailure: this.lastFailure } : {},
       restarts: this.restarts,
       ...stderr !== undefined && stderr.length > 0 ? { recentStderr: stderr.slice(-2000) } : {},
     }
@@ -620,15 +796,22 @@ export class GatewaySupervisor {
     const base = this.status()
     // 状态里没有 pid：subprocess 句柄不暴露 pid，用探活结果代替进程存活性判断。
     try {
-      const health = await this.probe()
-      if (health !== undefined) {
+      const outcome = await this.probe()
+      if (outcome.kind === 'ok') {
         // 实时结果覆盖缓存（缓存只是「上次启动时看到的」，可能已过期）。
-        this.health = health
-        return { ...base, health, state: base.state === 'stopped' ? 'external' : base.state }
+        this.health = outcome.report
+        return { ...base, health: outcome.report, state: base.state === 'stopped' ? 'external' : base.state }
+      }
+      if (outcome.kind === 'unreachable') {
+        // ★ 兑现「保留原因供状态命令展示」：这里以前是**静默**返回旧快照，
+        //   于是「网关在跑但这次探活超时」在 `/wb2api-status` 里看起来就是
+        //   「没探到」，与「端口上没人听」完全一样（实测 D3：报 state=stopped）。
+        return { ...base, lastError: `探活未拿到响应：${outcome.reason}` }
       }
     } catch (error) {
       return { ...base, lastError: error instanceof Error ? error.message : String(error) }
     }
+    // no-listener：端口上没人听，保持旧快照（调用方据此显示「未运行」）。
     return base
   }
 

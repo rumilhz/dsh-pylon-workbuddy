@@ -116,6 +116,67 @@ describe('renderReadinessNextSteps 的文案', () => {
     }))
     expect(lines[0]).toContain('网关尚未就绪（未安装 / 未登录）')
   })
+
+  /**
+   * ★ 2026-10-15：指引要**分病因**。
+   *
+   * 这两条钉住的是那次误判的**下游**：`probe()` 把「有监听但没回答」当成「端口无监听」，
+   * 于是 `start()` 记成 `failed`，而就绪度只看到「网关状态 failed」⇒ 打出
+   * 「请先执行 /wb2api-setup / /wb2api-login」—— 与真因无关（网关可能正在启动，
+   * 重装重登都不会让它变快），而且这两条命令**都会去动网关**。
+   *
+   * 判据：端口那一类失败时，指引里必须出现「看状态 / 再试一次」，
+   * 且**只有在真的缺安装或缺账号时**才允许出现 setup/login。
+   */
+  it('🔴 网关有监听但没应答（且账号齐全）⇒ 不再打「请先 /wb2api-setup」，改指看状态与重试', () => {
+    const readiness = assessStartupReadiness(readyFacts({
+      gatewayState: 'failed',
+      healthy: undefined,
+      enabledAccounts: 2,
+      gatewayFailure: 'port-unresponsive',
+    }))
+    expect(readiness.blockers.map(blocker => blocker.short)).toEqual(['网关无响应'])
+    const lines = renderReadinessNextSteps(readiness)
+    expect(lines[0]).toContain('网关尚未就绪（网关无响应）')
+    expect(lines.join('\n')).not.toContain('/wb2api-setup')
+    expect(lines.join('\n')).not.toContain('/wb2api-login')
+    expect(lines.join('\n')).toContain('/wb2api-status')
+    expect(lines.join('\n')).toContain('/wb2api-start')
+  })
+
+  it('🔴 端口被别的程序占用 ⇒ 指「释放端口 / 改 baseURL」，同样不打 setup/login', () => {
+    const readiness = assessStartupReadiness(readyFacts({
+      gatewayState: 'failed',
+      healthy: undefined,
+      enabledAccounts: 2,
+      gatewayFailure: 'port-foreign',
+    }))
+    expect(readiness.blockers.map(blocker => blocker.short)).toEqual(['端口被占用'])
+    const lines = renderReadinessNextSteps(readiness)
+    expect(lines.join('\n')).not.toContain('/wb2api-setup')
+    expect(lines.join('\n')).toContain('baseURL')
+  })
+
+  it('「端口有服务」与「未登录」同时成立时，两条指引都给（先登录、同时别去重装）', () => {
+    const readiness = assessStartupReadiness(readyFacts({
+      gatewayState: 'failed',
+      healthy: undefined,
+      enabledAccounts: 0,
+      gatewayFailure: 'port-unresponsive',
+    }))
+    expect(readiness.blockers.map(blocker => blocker.short)).toEqual(['未登录', '网关无响应'])
+    const lines = renderReadinessNextSteps(readiness)
+    // 真的没账号 ⇒ 通用那两行仍然要在（用户确实需要先登录）。
+    expect(lines.join('\n')).toContain('/wb2api-login cn')
+    // 但「网关在监听却不应答」这件事也必须说出来，且给出对应的下一步。
+    expect(lines.join('\n')).toContain('/wb2api-status')
+  })
+
+  it('没有 lastFailure（如进程崩退）⇒ 保持旧文案「网关未运行」', () => {
+    const readiness = assessStartupReadiness(readyFacts({ gatewayState: 'failed', healthy: undefined, enabledAccounts: 2 }))
+    expect(readiness.blockers.map(blocker => blocker.short)).toEqual(['网关未运行'])
+    expect(renderReadinessNextSteps(readiness).join('\n')).toContain('/wb2api-setup')
+  })
 })
 
 describe('seed 失败文案的分场景（手工粘贴块该不该给）', () => {

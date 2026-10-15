@@ -42,9 +42,9 @@
  */
 
 import { existsSync, readdirSync, readFileSync, renameSync } from 'node:fs'
-import { basename, join, resolve } from 'node:path'
+import { basename, join } from 'node:path'
 import type { GatewayPluginConfig } from './config.js'
-import { dshHome } from './plugin-state.js'
+import { resolveAuthDir } from './auth-dir.js'
 
 /**
  * 禁用后缀。刻意用 `.json.disabled` 而不是 `*.bak` / 挪到别的目录：
@@ -187,43 +187,22 @@ export class AccountStore {
   /**
    * 定位网关实际使用的 auths 目录。
    *
-   * 基准目录的选取必须与 `GatewaySupervisor.resolveWorkingDir()` **完全一致** ——
-   * 否则本命令会去改一个网关根本不读的目录，且不报任何错（切换"成功"了但账号没变）。
-   * 顺序：`workingDir` → `repoPath` → 插件运行目录 `<DSH home>/wb2api/`（`/wb2api-setup`
-   * 下载二进制时把凭证放在这里）→ 当前工作目录。
+   * ★ 推导逻辑**不在本方法里** —— 它落在 {@link resolveAuthDir}，因为
+   * `GatewaySupervisor.countAuthFiles()` 必须数**同一个**目录（那个数字出现的场合
+   * 全是「解释为什么没有可用账号」的文案，口径一旦分叉就会把人指到空目录）。
    *
-   * ★ 基准目录的 home 口径是 {@link dshHome}（`DSH_HOME` → `~/.dsh`），与
-   * `defaultRuntimeDir()` / `GatewaySupervisor.resolveWorkingDir()` **同源**。
-   * 只改其中一处就会得到「轨迹在隔离 home、凭证却写进活体」这种最难查的形态
-   * （2026-10-15 从零验证实测）。
+   * 基准顺序：`workingDir` → `repoPath` → 插件运行目录 `<DSH home>/wb2api/`
+   * （`/wb2api-setup` 下载二进制时把凭证放在这里）→ 当前工作目录；
+   * 目录名读网关 `config.json` 的 `auth_dir`（相对基准目录解析），
+   * 缺失或解析失败才回退 `./auths`。刻意不硬编码 `auths`：用户改了 `auth_dir`
+   * 而插件仍去改默认目录的话，会「改了个没用的地方」且不报错。
    *
-   * 目录名本身优先读网关 `config.json` 的 `auth_dir`（相对基准目录解析），
-   * 缺失或解析失败才回退 `./auths`。刻意不硬编码：用户改了 `auth_dir` 而插件仍去改
-   * 默认目录的话，会「改了个没用的地方」且不报错。
+   * 基准目录的 home 口径是 `dshHome()`（`DSH_HOME` → `~/.dsh`，见 `plugin-state.ts`），
+   * 与 `GatewaySupervisor.resolveWorkingDir()` **同源**。只改其中一处就会得到
+   * 「轨迹在隔离 home、凭证却写进活体」这种最难查的形态（2026-10-15 从零验证实测）。
    */
   authDir(): string {
-    const { repoPath, workingDir } = this.options.config
-    const runtime = join(dshHome(), 'wb2api')
-    const base = workingDir !== ''
-      ? workingDir
-      : repoPath !== ''
-        ? repoPath
-        : existsSync(join(runtime, 'config.json')) ? runtime : ''
-    // config.json 的读取位置与基准目录一致：两处都看同一个文件，避免"目录用 A、配置读 B"。
-    const configRoot = base !== '' ? base : repoPath
-    let authDir = './auths'
-    if (configRoot !== '') {
-      const configFile = join(configRoot, 'config.json')
-      try {
-        if (existsSync(configFile)) {
-          const parsed = JSON.parse(readFileSync(configFile, 'utf8')) as { auth_dir?: unknown }
-          if (typeof parsed.auth_dir === 'string' && parsed.auth_dir !== '') authDir = parsed.auth_dir
-        }
-      } catch {
-        // 忽略：网关 config.json 不存在或不是 JSON 时按默认 ./auths 处理。
-      }
-    }
-    return base === '' ? resolve(authDir) : resolve(base, authDir)
+    return resolveAuthDir(this.options.config)
   }
 
   /**

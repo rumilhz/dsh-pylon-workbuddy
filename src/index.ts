@@ -1841,6 +1841,9 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
       gatewayState: snapshot.state,
       healthy: snapshot.health?.healthy,
       enabledAccounts,
+      // ★ 把失败**类别**带进去，指引才能分病因（「端口上有服务」那一类不能再打
+      //   「请先 /wb2api-setup」—— 见 startup-readiness.ts 的 ReadinessBlocker.nextSteps）。
+      gatewayFailure: snapshot.lastFailure,
     })
     if (readiness.ready) {
       trace(`ready: 已就绪（网关 ${snapshot.state} · 账号 ${snapshot.health?.healthy ?? enabledAccounts} 可用）`)

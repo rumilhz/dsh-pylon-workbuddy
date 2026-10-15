@@ -43,12 +43,27 @@ export interface ReadinessFacts {
   healthy?: number | undefined
   /** 本地 `auths/` 里**启用中**的凭证文件数。 */
   enabledAccounts: number
+  /**
+   * supervisor 记下的失败**类别**（`GatewaySupervisor.status().lastFailure`）。
+   *
+   * 只用来把指引改对：`port-unresponsive` / `port-foreign` 都是「端口上有服务」，
+   * 这时打「请先 `/wb2api-setup`」是**张冠李戴**（见 {@link ReadinessBlocker.nextSteps}）。
+   */
+  gatewayFailure?: string | undefined
 }
 
 /** 一条「为什么没就绪」。`short` 进括号（`未安装 / 未登录`），`detail` 给人看。 */
 export interface ReadinessBlocker {
   short: string
   detail: string
+  /**
+   * 这一条**自己的**下一步（可选）。
+   *
+   * 缺省时用通用的「`/wb2api-setup` + `/wb2api-login`」两行 —— 那两行只对
+   * 「没装 / 没登录」成立。端口上有服务却没应答时它们**帮不上忙**（网关可能
+   * 正在启动，重装重登都不会让它变快），必须换成看状态与重试。
+   */
+  nextSteps?: string[]
 }
 
 /** 就绪度结论。 */
@@ -95,7 +110,29 @@ export function assessStartupReadiness(facts: ReadinessFacts): StartupReadiness 
     || facts.gatewayState === 'unhealthy'
     || facts.gatewayState === 'external'
   if (!gatewayUp && installed) {
-    blockers.push({ short: '网关未运行', detail: `网关状态 ${facts.gatewayState ?? '未知（未托管）'}` })
+    // ★ 2026-10-15：这里以前只有一条「网关未运行」。而「端口上有服务、只是没在探活
+    //   预算内应答/不是本网关」会让 state 停在 failed ⇒ 也落进这一条 ⇒ 指引变成
+    //   「请先 /wb2api-setup」，与真因无关（网关可能正在启动，也正是那次误判的受害者）。
+    if (facts.gatewayFailure === 'port-unresponsive' || facts.gatewayFailure === 'port-foreign') {
+      const unresponsive = facts.gatewayFailure === 'port-unresponsive'
+      blockers.push({
+        short: unresponsive ? '网关无响应' : '端口被占用',
+        detail: unresponsive
+          ? '端口上有服务在监听，但它没有在一次探活预算内应答（网关可能正在启动，或已卡住）'
+          : '端口上有服务在监听，但它不是本网关（/healthz 不认）',
+        nextSteps: unresponsive
+          ? [
+              `  /wb2api-status            ← 看网关与账号的真实状态（含最近一次探活原因）`,
+              `  /wb2api-start             ← 稍后再试一次（网关可能正在启动）`,
+            ]
+          : [
+              `  /wb2api-status            ← 看最近一次失败原因`,
+              `  端口被别的程序占用 —— 释放它，或改插件的 baseURL / listenPort 后重启 dsh`,
+            ],
+      })
+    } else {
+      blockers.push({ short: '网关未运行', detail: `网关状态 ${facts.gatewayState ?? '未知（未托管）'}` })
+    }
   }
   return { ready: blockers.length === 0, blockers }
 }
@@ -113,16 +150,32 @@ export const LOGIN_COMMAND_LINE = '  /wb2api-login cn         ← 如果你还�
  * 文案只此一份：启动路径播报它，`seed` 那一步的失败文案引用它，
  * 以后若再加入口（比如设置卡片）也复用同一份，不写第二遍。
  *
+ * ★ 指引要**分病因**（2026-10-15 修）：通用那两行（`/wb2api-setup` 与
+ * `/wb2api-login`）只对「没装 / 没登录」成立。若这次没就绪里有「端口上有服务」
+ * 那一类原因，就把**它自己的**下一步接在后面 —— 否则用户会被指去重装重登，
+ * 而真问题是网关正在启动 / 端口被别的程序占了。
+ *
  * @param readiness - {@link assessStartupReadiness} 的结论。
- * @returns 行数组（第一行说明原因，后两行是可直接照抄的命令）；就绪时 `[]`。
+ * @returns 行数组（第一行说明原因，其后是可直接照抄的命令）；就绪时 `[]`。
  */
 export function renderReadinessNextSteps(readiness: StartupReadiness): string[] {
   if (readiness.ready) return []
   const shorts = readiness.blockers.map(blocker => blocker.short).join(' / ')
   const details = readiness.blockers.map(blocker => blocker.detail).join('；')
+  // 「没装 / 没登录」在时，通用的两行仍然要打（用户确实需要先做那两件事），
+  // 并把分病因的下一步接在后面 —— 两者可以同时成立。
+  //
+  // 没有分病因的下一步时，通用两行照旧是**默认**（例如「网关未运行 / 进程崩退」：
+  // 那时 `/wb2api-setup` 仍是合理的下一步）。反过来，只要这次未就绪里有
+  // 「端口上有服务」那一类原因，就不许只打通用两行 —— 那正是错误指引。
+  const needsInstallOrLogin = readiness.blockers.some(
+    blocker => blocker.short === '未安装' || blocker.short === '未登录',
+  )
+  const tailored = readiness.blockers.flatMap(blocker => blocker.nextSteps ?? [])
+  const useGeneric = needsInstallOrLogin || tailored.length === 0
   return [
     `网关尚未就绪（${shorts}）—— ${details}。请先执行：`,
-    SETUP_COMMAND_LINE,
-    LOGIN_COMMAND_LINE,
+    ...useGeneric ? [SETUP_COMMAND_LINE, LOGIN_COMMAND_LINE] : [],
+    ...tailored,
   ]
 }
