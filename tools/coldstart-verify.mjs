@@ -632,30 +632,49 @@ if (!reusable) {
         name: `dsh-profile-${PROFILE_NAME}`,
         private: true,
         dependencies: { [PLUGIN_PACKAGE]: `link:${PLUGIN_DIR.replaceAll('\\', '/')}` },
-        dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', `@deepseek-ai/${SETTINGS_NS}`, PLUGIN_PACKAGE] } },
+        // ★ bundles 里**只写实际存在的包**。实测：`@deepseek-ai/llm-pi-ai` **不存在**
+        //   （真名是 `@deepseek-ai/dsh-llm-pi-ai`），写进 bundles 只会让 dsh 打一条
+        //   `skipping profile bundle … cannot resolve` 的警告；而 `llm-pi-ai` 这个
+        //   **条目**本来就由 `@deepseek-ai/dsh-base` 提供 —— 组合结果里有它，name 也正确。
+        dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', PLUGIN_PACKAGE] } },
       },
       null,
       2,
     )}\n`,
     'utf8',
   )
-  // 必须是**顶层 YAML 数组**（解析成 null 会被 boot 拒绝）。两条目：
-  //   ① 数据面 namespace 先放一个空 `providers`，等插件把 workbuddy 写进来。
-  //      它的 `name` 必须是带 scope 的真包名，不带 scope 会在解析期直接报错。
-  //   ② `- id: pylon-workbuddy` 覆盖**实例配置**。★ 这里的 `id` 是**实例 id**
-  //      （= 插件包里 `export const name`，**不是**包名 `dsh-pylon-workbuddy`）：
-  //      写成包名等于什么也没覆盖（本脚本第一版就是这么错的）。
+  // 必须是**顶层 YAML 数组**（解析成 null 会被 boot 拒绝）。
+  //
+  // ★ 这里**刻意不写** `- id: llm-pi-ai / name: "@deepseek-ai/llm-pi-ai"` 那一条。
+  //
+  //   实测（`dsh --profile <p> --dump-config` 的 stderr，逐字）：
+  //     dsh: [<profile>\cordis.patch.yml] patch: name mismatch for "llm-pi-ai"
+  //          (expected "@deepseek-ai/dsh-llm-pi-ai", got "@deepseek-ai/llm-pi-ai"), skipping
+  //
+  //   三个事实合起来说明那一条**整条都该删**（而不是把包名改对）：
+  //     ① 包名写错了（真名 `@deepseek-ai/dsh-llm-pi-ai`）⇒ 解析不到；
+  //     ② `llm-pi-ai` 这个条目本来就由 `@deepseek-ai/dsh-base` 提供
+  //        （组合结果里 `- id: llm-pi-ai` 照样在，name 正确；本脚本下面的 bundles
+  //         就是 `dsh-base` + 本插件，不需要在 patch 里再声明一次）；
+  //     ③ 它带的 `config.providers: {}` 是**整段覆盖**而不是合并 —— 一旦哪天 name
+  //        对上了（或 dsh 改成按 id 兜底），它就会把 base 那边的 providers 清空。
+  //        改个名字反而会把这条隐患变成真的。
+  //   所以现在 patch 里**只留实例配置覆盖**，与活体 profile 的形态一致
+  //   （活体 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `- id: llm-pi-ai` 用的是
+  //    `name: "@deepseek-ai/dsh-llm-pi-ai"`，而它下面那些 provider 是**用户自己的**，
+  //    不是 base 给的默认值 —— 本脚本不该在这里造第二个来源）。
+  //
+  //   `- id: pylon-workbuddy` 覆盖**实例配置**。★ 这里的 `id` 是**实例 id**
+  //   （= 插件包里 `export const name`，**不是**包名 `dsh-pylon-workbuddy`）：
+  //   写成包名等于什么也没覆盖（本脚本第一版就是这么错的）。
   //   ★ **不要**再手写 `- insert:` —— profile 的 `dsh.profile.bundles` 已经把插件
-  //     挂进组合，插件的 `cordis.patch.yml` 也自带一条 insert；再写一条实测会让插件
-  //     **mount 两次**（boot.log 里每个锚点出现两遍，两份配置各创建一次 provider）。
+  //   挂进组合，插件的 `cordis.patch.yml` 也自带一条 insert；再写一条实测会让插件
+  //   **mount 两次**（boot.log 里每个锚点出现两遍，两份配置各创建一次 provider）。
   writeFileSync(
     PATCH,
     [
       '# scratch profile patch (user layer) — 本插件把 provider 条目写在这里',
-      `- id: ${SETTINGS_NS}`,
-      `  name: "@deepseek-ai/${SETTINGS_NS}"`,
-      '  config:',
-      '    providers: {}',
+      '# （数据面 llm-pi-ai 由 bundles 里的 @deepseek-ai/dsh-base 提供，不要在这里重写）',
       '# 覆盖实例配置：端口刻意避开活体网关的 7863，运行目录全部落在 scratch 内',
       `- id: ${PLUGIN_INSTANCE}`,
       '  config:',
@@ -672,7 +691,7 @@ if (!reusable) {
   )
   symlinkSync(PLUGIN_DIR, junction, 'junction')
   rmSync(STATE_FILE, { force: true })
-  info(`临时 profile 已重建：cordis.yml=[] · package.json(bundles=base+${SETTINGS_NS}+${PLUGIN_PACKAGE}) · 只 junction 本插件`)
+  info(`临时 profile 已重建：cordis.yml=[] · package.json(bundles=base+${PLUGIN_PACKAGE}) · 只 junction 本插件`)
 } else {
   info('--keep-profile：沿用现有临时 profile（不重置 patch、不重建 home）')
   mkdirSync(join(PROFILE, 'node_modules'), { recursive: true })

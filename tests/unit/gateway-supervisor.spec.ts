@@ -119,6 +119,67 @@ describe('GatewaySupervisor.probe', () => {
     })
     await expect(supervisor.probe()).rejects.toThrow(/端口可能被其他程序占用/)
   })
+
+  /**
+   * ★ 这条钉住的是一个**实测到的形态**：网关没有可用账号时 `/healthz` 返回 503
+   *   （仓库自己的 `docs/handoff-20260915-gateway-plugin.md:268` 记着这件事，
+   *   2026-10-15 的从零验证逐字抓到 `HTTP 503 {"healthy":0,…,"service":"workbuddy2api",…}`）。
+   *
+   *   过去它被当成「端口被别的程序占用」，于是：自动启动白等满 30s 预算后报一条
+   *   **假的**「FAILED — /healthz 未就绪」，而网关其实正在跑、只是没账号。
+   */
+  it('🔴 /healthz 返回 503（网关在跑但没有账号）⇒ 照常给出 healthy/total，不抛错', async () => {
+    const gateway = await startFakeGateway(() => ({
+      status: 503,
+      body: JSON.stringify({ healthy: 0, total: 0, service: 'workbuddy2api', realm_servable: { cn: false, global: false } }),
+    }))
+    cleanups.push(gateway.close)
+    const { runtime } = makeSubprocess()
+    const supervisor = new GatewaySupervisor({
+      config: resolveConfig({ baseURL: `http://127.0.0.1:${gateway.port}/v1` }),
+      subprocess: runtime,
+      logger: silentLogger,
+    })
+    const health = await supervisor.probe()
+    expect(health?.healthy).toBe(0)
+    expect(health?.total).toBe(0)
+    expect(health?.service).toBe('workbuddy2api')
+    expect(health?.realmServable).toEqual({ cn: false, global: false })
+  })
+
+  it('503 但响应体不是本网关（别的服务的 JSON / 非 JSON）⇒ 仍然抛「端口被占用」', async () => {
+    const cases = [
+      JSON.stringify({ service: 'something-else', healthy: 0, total: 0 }),
+      JSON.stringify({ status: 'unavailable' }),
+      '<html>503</html>',
+    ]
+    for (const body of cases) {
+      const other = await startFakeGateway(() => ({ status: 503, body }))
+      cleanups.push(other.close)
+      const { runtime } = makeSubprocess()
+      const supervisor = new GatewaySupervisor({
+        config: resolveConfig({ baseURL: `http://127.0.0.1:${other.port}/v1` }),
+        subprocess: runtime,
+        logger: silentLogger,
+      })
+      await expect(supervisor.probe()).rejects.toThrow(/端口可能被其他程序占用/)
+    }
+  })
+
+  it('别的非 2xx（如 500）即便长得像本网关也不认 —— 只认 503 这条「无账号」信号', async () => {
+    const other = await startFakeGateway(() => ({
+      status: 500,
+      body: JSON.stringify({ healthy: 0, total: 0, service: 'workbuddy2api' }),
+    }))
+    cleanups.push(other.close)
+    const { runtime } = makeSubprocess()
+    const supervisor = new GatewaySupervisor({
+      config: resolveConfig({ baseURL: `http://127.0.0.1:${other.port}/v1` }),
+      subprocess: runtime,
+      logger: silentLogger,
+    })
+    await expect(supervisor.probe()).rejects.toThrow(/端口可能被其他程序占用/)
+  })
 })
 
 describe('GatewaySupervisor.start', () => {

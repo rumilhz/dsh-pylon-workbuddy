@@ -42,9 +42,9 @@
  */
 
 import { existsSync, readdirSync, readFileSync, renameSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import type { GatewayPluginConfig } from './config.js'
+import { dshHome } from './plugin-state.js'
 
 /**
  * 禁用后缀。刻意用 `.json.disabled` 而不是 `*.bak` / 挪到别的目录：
@@ -189,8 +189,13 @@ export class AccountStore {
    *
    * 基准目录的选取必须与 `GatewaySupervisor.resolveWorkingDir()` **完全一致** ——
    * 否则本命令会去改一个网关根本不读的目录，且不报任何错（切换"成功"了但账号没变）。
-   * 顺序：`workingDir` → `repoPath` → 插件运行目录 `~/.dsh/wb2api/`（`/wb2api-setup`
+   * 顺序：`workingDir` → `repoPath` → 插件运行目录 `<DSH home>/wb2api/`（`/wb2api-setup`
    * 下载二进制时把凭证放在这里）→ 当前工作目录。
+   *
+   * ★ 基准目录的 home 口径是 {@link dshHome}（`DSH_HOME` → `~/.dsh`），与
+   * `defaultRuntimeDir()` / `GatewaySupervisor.resolveWorkingDir()` **同源**。
+   * 只改其中一处就会得到「轨迹在隔离 home、凭证却写进活体」这种最难查的形态
+   * （2026-10-15 从零验证实测）。
    *
    * 目录名本身优先读网关 `config.json` 的 `auth_dir`（相对基准目录解析），
    * 缺失或解析失败才回退 `./auths`。刻意不硬编码：用户改了 `auth_dir` 而插件仍去改
@@ -198,7 +203,7 @@ export class AccountStore {
    */
   authDir(): string {
     const { repoPath, workingDir } = this.options.config
-    const runtime = join(homedir(), '.dsh', 'wb2api')
+    const runtime = join(dshHome(), 'wb2api')
     const base = workingDir !== ''
       ? workingDir
       : repoPath !== ''

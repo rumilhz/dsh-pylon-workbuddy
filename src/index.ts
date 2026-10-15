@@ -40,6 +40,11 @@ import {
 } from './provider-config.js'
 import { openTombstone } from './plugin-state.js'
 import { trace } from './boot-trace.js'
+import {
+  assessStartupReadiness,
+  renderReadinessNextSteps,
+  type StartupReadiness,
+} from './startup-readiness.js'
 import { maskNickname } from './nickname.js'
 import {
   createPanelApi,
@@ -458,20 +463,42 @@ function manualBlockHeader(): string {
 }
 
 /**
+ * {@link renderSeedOutcome} 的可选开关。
+ */
+export interface SeedRenderOptions {
+  /**
+   * 网关是否已就绪（起得来 + 有可用账号）。
+   *
+   * `false` ⇒ **不打「手工粘贴块」**。那个块的适用场景是「网关正常、只有写入失败」；
+   * 从零未就绪时给它是**误导**：用户会去手写一份 provider，而真问题是网关没装/没登录
+   * （下一步该敲什么，启动路径那条指引已经打在它上面了）。
+   *
+   * 省略（`undefined`）= 不判定，保持旧行为（照常给块）—— `/wb2api-provider`
+   * 那条路是用户显式敲的命令，没有「启动就绪度」可谈。
+   */
+  gatewayReady?: boolean | undefined
+}
+
+/** 墓碑写回失败时的附加说明（不影响 provider 本身的结果，所以只挂一行）。 */
+function renderStateWarning(warning: string | undefined): string {
+  return warning === undefined ? '' : `\n⚠ ${warning}`
+}
+
+/**
  * 把 {@link SeedOutcome} 渲染成日志/命令文本。
  *
  * 分支文案集中在这里，避免「启动日志」与「`/wb2api-provider` 输出」两处漂移。
  *
  * @param outcome - 本次结果。
  * @param config - 插件配置（取 provider 名与端点）。
+ * @param options - 见 {@link SeedRenderOptions}（只有启动路径会传）。
  * @returns 多行文本（不带前缀，调用方决定 logger 级别）。
  */
-/** 墓碑写回失败时的附加说明（不影响 provider 本身的结果，所以只挂一行）。 */
-function renderStateWarning(warning: string | undefined): string {
-  return warning === undefined ? '' : `\n⚠ ${warning}`
-}
-
-function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): string {
+export function renderSeedOutcome(
+  outcome: SeedOutcome,
+  config: GatewayPluginConfig,
+  options: SeedRenderOptions = {},
+): string {
   const name = config.providerName
   switch (outcome.kind) {
     case 'present':
@@ -598,8 +625,17 @@ function renderSeedOutcome(outcome: SeedOutcome, config: GatewayPluginConfig): s
         lines.push(...renderProviderNotes(outcome.notes))
       }
       if (outcome.manualBlock !== undefined) {
-        lines.push('', manualBlockHeader(), outcome.manualBlock.replace(/\n$/, ''))
-        lines.push('（贴完保存即可，dsh 会热加载 profile patch；不确定就先备份该文件。）')
+        if (options.gatewayReady === false) {
+          // ★ 分场景：手工粘贴块的适用场景是「**网关正常**、只有写入失败」。
+          //   从零未就绪（没装网关 / 没登录）时给它是误导 —— 用户会照着手写一份
+          //   provider，而真正要做的是装网关、登录（那段指引已经打在它上面了）。
+          lines.push('', '网关尚未就绪时不需要手工写 provider —— 先按上面那三行执行：'
+            + '/wb2api-setup（一键安装）→ /wb2api-login cn|global（登录），'
+            + '就绪后重跑 /wb2api-provider --create 即可。')
+        } else {
+          lines.push('', manualBlockHeader(), outcome.manualBlock.replace(/\n$/, ''))
+          lines.push('（贴完保存即可，dsh 会热加载 profile patch；不确定就先备份该文件。）')
+        }
       }
       return lines.join('\n')
     }
@@ -1687,6 +1723,19 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
   }, 'workbuddy2api: gateway lifecycle')
 
   // ④ 自动启动：延迟到 fiber 稳定后再拉起，避免插件加载阶段阻塞 dsh 启动。
+  /**
+   * 自动启动那一轮的结束时刻。
+   *
+   * ★ 就绪度那一步会 `await` 它，两个理由：
+   *   ① 「网关有没有起来」只有在它跑完之后才是一个**事实** —— 在它之前读到的
+   *      只可能是 `stopped`，那会把「正在启动」误报成「未就绪」；
+   *   ② 这样也保证「未就绪 ⇒ 下一步敲什么」的指引**排在 seed 结局行之前**
+   *      （验收脚本正是在 seed 行出现后立刻读 boot.log 的）。
+   *
+   * `autoStart` 关闭时立刻 resolve：那种形态下就绪度不判定（见下面的说明）。
+   */
+  let markAutostartDone: () => void = () => {}
+  const autostartDone = new Promise<void>((resolve) => { markAutostartDone = resolve })
   if (config.autoStart && supervisor !== undefined) {
     const timer = setTimeout(() => {
       void (async () => {
@@ -1733,7 +1782,7 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
           + '可用 /wb2api-setup 或 /wb2api-start 手工重试。',
         )
         trace(`gateway: 自动启动 threw — ${error instanceof Error ? error.message : String(error)}`)
-      })
+      }).finally(markAutostartDone)
     }, 0)
     timer.unref?.()
     ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: autostart timer')
@@ -1743,7 +1792,82 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     trace(config.autoStart
       ? 'gateway: 未自动启动（subprocess 服务缺失）'
       : 'gateway: 未自动启动（autoStart=false）')
+    markAutostartDone()
   }
+
+  /**
+   * 启动就绪度：网关起没起来 + 有没有可用账号；未就绪时把「下一步敲什么」打到**两个通道**。
+   *
+   * ## 为什么必须有这一步
+   *
+   * 从零的环境（新电脑、空 `wb2api/`、零凭证）里，插件过去只打
+   * 「provider 不存在，且写入 settings 失败」+ 一段**手工 YAML 块**，
+   * 而真问题（网关没装 / 没登录）一个字都没说 —— 2026-10-15 的从零验证实测：
+   * boot.log 与 stdout 两个通道命中 **0 条**指向前一步命令的指引。
+   *
+   * ## 只在「网关由本插件负责」时判定与播报
+   *
+   * `autoStart=false` 是「网关我自己管」的明确声明（甚至可能稍后才起），这时打
+   * 「请跑 /wb2api-setup」是张冠李戴；`subprocess` 缺失时插件**根本没有托管能力**，
+   * 说「未安装」也只是猜（没查过 PATH）。两种形态都只留一行轨迹说明**为什么没判** ——
+   * seed 那一步因此拿不到结论，保持旧行为（照常给手工块），这是这里最保守的选择。
+   *
+   * ## 事实全部来自本地 + 已缓存的探活
+   *
+   * `supervisor.status()` 用的是自动启动那一轮已经探到的 `/healthz` 结果（缓存），
+   * 因此这里**不再打一次网络** —— 每多加一次探活，就是给「新用户第一眼看到什么」
+   * 再延后一次。
+   *
+   * @returns 就绪度结论；不判定时（见上）为 `undefined`。
+   */
+  const reportStartupReadiness = async (): Promise<StartupReadiness | undefined> => {
+    if (!config.autoStart || supervisor === undefined) {
+      trace(!config.autoStart
+        ? 'ready: 跳过（autoStart=false —— 网关不由本插件托管，不打「下一步」指引）'
+        : 'ready: 跳过（subprocess 服务缺失 —— 插件无法托管网关，不打「下一步」指引）')
+      return undefined
+    }
+    let binaryPath: string | undefined
+    try {
+      binaryPath = await supervisor.resolveBinary()
+    } catch {
+      binaryPath = undefined
+    }
+    const snapshot = supervisor.status()
+    const inventory = accountStore.list()
+    const enabledAccounts = inventory.filter(account => account.enabled).length
+    const readiness = assessStartupReadiness({
+      binaryPath,
+      gatewayState: snapshot.state,
+      healthy: snapshot.health?.healthy,
+      enabledAccounts,
+    })
+    if (readiness.ready) {
+      trace(`ready: 已就绪（网关 ${snapshot.state} · 账号 ${snapshot.health?.healthy ?? enabledAccounts} 可用）`)
+      return readiness
+    }
+    // 两个通道都走，理由与 `[workbuddy2api] apply 开始` 那条一致：boot.log 的锚点
+    // 能活过日志被截断（排障时看它），stdout 才是用户第一眼看到的那一屏。
+    const lines = renderReadinessNextSteps(readiness)
+    for (const row of lines) trace(`next: ${row.trimStart()}`)
+    const text = `[workbuddy2api] ${lines.join('\n')}`
+    console.warn(text)
+    ctx.logger.warn(text)
+    return readiness
+  }
+
+  /**
+   * 就绪度：等自动启动落地后再算，**一次算好、两处共用**（启动指引 + seed 的手工块判定）。
+   *
+   * 永不 reject —— seed 那一步在它上面 `await`，一次抛错会让 `seed:` 结局行
+   * 永远不出现（验收脚本与用户都在等那一行）。
+   */
+  const readinessSettled: Promise<StartupReadiness | undefined> = autostartDone
+    .then(async () => await reportStartupReadiness())
+    .catch((error: unknown) => {
+      trace(`ready: 判定抛错 — ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    })
 
   // ⑤ 可编辑 provider：与自动启动**并行**的独立一步。
   //
@@ -1759,24 +1883,29 @@ export function apply(ctx: Context, rawConfig?: Partial<GatewayPluginConfig>): v
     // 这一行、没有后面的 `seed: start`，成因就唯一确定了。
     trace('seed: 已排入 setTimeout(0)（与自动启动并行）')
     const timer = setTimeout(() => {
-      void ensureEditableProvider(ctx, config, () => apiKeyResolver())
-        .then((outcome) => {
-          const text = `[workbuddy2api] ${renderSeedOutcome(outcome, config)}`
+      void (async () => {
+        try {
+          // ★ 先等就绪度落地（它本身在等自动启动那一轮）。两个作用：
+          //   ① 保证「未就绪 ⇒ 下一步敲什么」的指引**排在本行之前**进 boot.log；
+          //   ② 手工粘贴块该不该打，取决于这次结论（见 SeedRenderOptions）。
+          const readiness = await readinessSettled
+          const outcome = await ensureEditableProvider(ctx, config, () => apiKeyResolver())
+          const text = `[workbuddy2api] ${renderSeedOutcome(outcome, config, { gatewayReady: readiness?.ready })}`
           // 两处都发：stdout 保证「写路径到底发生了什么」在 host 日志里看得见，
           // logger 保持走框架日志系统。理由见模块顶部那条注释 —— 2026-10-14 实测
           // 发现只发 `ctx.logger` 等于没写，而这正是当时排查卡住的原因。
           if (outcome.kind === 'failed') { console.error(text); ctx.logger.error(text) }
           else if (outcome.kind === 'skipped') { console.warn(text); ctx.logger.warn(text) }
           else { console.log(text); ctx.logger.info(text) }
-        })
-        .catch((error: unknown) => {
+        } catch (error: unknown) {
           // 这一步的任何异常都不该影响 dsh 启动 —— 网关托管与命令面照常可用。
           const text = `[workbuddy2api] 可编辑 provider 检查失败：${error instanceof Error ? error.message : String(error)}。`
             + '可执行 /wb2api-provider 查看现状。'
           console.error(text)
           ctx.logger.error(text)
           trace(`seed: threw — ${error instanceof Error ? error.message : String(error)}`)
-        })
+        }
+      })()
     }, 0)
     timer.unref?.()
     ctx.effect(() => () => { clearTimeout(timer) }, 'workbuddy2api: provider seed timer')

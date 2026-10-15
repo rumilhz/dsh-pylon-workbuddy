@@ -103,6 +103,56 @@ function nonEmpty(value: string | undefined): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
+/** {@link resolveDshHome} 的入参（可注入，便于单测）。 */
+export interface DshHomeInput {
+  /** 环境变量表；缺省用 `process.env`。 */
+  env?: Record<string, string | undefined> | undefined
+  /** 注入 `os.homedir`；返回空串/`undefined`、或直接抛错，都算「拿不到」。 */
+  homedir?: (() => string | undefined) | undefined
+}
+
+/**
+ * DSH 数据根：`DSH_HOME`（非空）→ `~/.dsh`。**全插件唯一的 home 口径。**
+ *
+ * ## 为什么它必须是唯一的一份
+ *
+ * `state.json` / `boot.log` 的落点、网关安装目录、网关运行目录、网关 `auths/` 目录
+ * 全都以 DSH home 为基准。只把其中几处改成认 `DSH_HOME`，就会得到一种最难查的形态：
+ * 轨迹写在隔离 home 里（看起来"隔离成功"），而网关二进制与凭证却落进活体
+ * `~/.dsh/wb2api`（2026-10-15「真·从零验证」实测到的正是这一条）。
+ *
+ * `DSH_HOME` 未设时逐字等于 DSH 自己的默认值（`~/.dsh`），活体用户行为完全不变；
+ * 设了 `DSH_HOME` 的隔离验证/多实例环境，则整体跟着走。
+ *
+ * @param input - 可注入的 env / homedir（单测用）。
+ * @returns 绝对路径；两条来源都拿不到时 `undefined`（调用方据此降级，而不是抛错）。
+ */
+export function resolveDshHome(input: DshHomeInput = {}): string | undefined {
+  const env = input.env ?? process.env
+  const fromEnv = nonEmpty(env['DSH_HOME'])
+  if (fromEnv !== undefined) return fromEnv
+  const homedir = input.homedir ?? osHomedir
+  let base: string | undefined
+  try {
+    base = nonEmpty(homedir())
+  } catch {
+    base = undefined
+  }
+  return base === undefined ? undefined : join(base, '.dsh')
+}
+
+/**
+ * {@link resolveDshHome} 的**字符串版** —— 给「无论如何都要拼出一条路径」的调用点
+ * （网关安装目录 / 网关运行目录 / 网关 `auths/` 目录；它们没有「不落盘」这条分支）。
+ *
+ * `DSH_HOME` 未设时逐字等于旧行为：`join(os.homedir(), '.dsh')`。连 `os.homedir()`
+ * 都拿不到的极端环境仍然走老路（照旧抛错，或拼出一条相对路径），**不会**静默换成
+ * 别的目录 —— 那会把「读不到 home」伪装成一个更难查的写入错误。
+ */
+export function dshHome(): string {
+  return resolveDshHome() ?? join(osHomedir(), '.dsh')
+}
+
 /**
  * 状态文件的绝对路径。
  *
@@ -116,7 +166,7 @@ export function stateFilePath(home: string): string {
 /**
  * 推导状态文件的落点。
  *
- * 顺序：`profileHome` → `env.DSH_HOME` → `os.homedir()/.dsh`（DSH 自己的默认值）。
+ * 顺序：`profileHome` → {@link resolveDshHome}（`DSH_HOME` → `~/.dsh`，DSH 自己的默认值）。
  * 三条都拿不到时返回 `undefined` —— **调用方据此不启用墓碑，而不是抛错**。
  *
  * @param input - 可注入的 home 来源。
@@ -127,23 +177,13 @@ export function resolveStateLocation(input: StateLocationInput = {}): StateLocat
   if (fromProfile !== undefined) {
     return { home: fromProfile, path: stateFilePath(fromProfile), source: 'profile' }
   }
-  const env = input.env ?? process.env
-  const fromEnv = nonEmpty(env['DSH_HOME'])
-  if (fromEnv !== undefined) {
-    return { home: fromEnv, path: stateFilePath(fromEnv), source: 'env' }
-  }
-  // 最后一条是 DSH 自己的默认值（`dshHome()` 的实现就是 `DSH_HOME ?? ~/.dsh`）。
+  // 后两条来源走**唯一的 home 口径**（{@link resolveDshHome}：`DSH_HOME` → `~/.dsh`）——
+  // 与网关安装目录 / 运行目录 / `auths/` 目录是同一段代码，不会各走各的。
   // 它也可能拿不到（被裁剪过的运行时 / 没有 home 的容器）—— 那时就是真的降级。
-  const homedir = input.homedir ?? osHomedir
-  let base: string | undefined
-  try {
-    base = nonEmpty(homedir())
-  } catch {
-    base = undefined
-  }
-  if (base === undefined) return undefined
-  const home = join(base, '.dsh')
-  return { home, path: stateFilePath(home), source: 'default' }
+  const home = resolveDshHome(input)
+  if (home === undefined) return undefined
+  const fromEnv = nonEmpty((input.env ?? process.env)['DSH_HOME'])
+  return { home, path: stateFilePath(home), source: fromEnv === undefined ? 'default' : 'env' }
 }
 
 /** 是不是一份「普通对象」（不是数组、不是 null）。 */

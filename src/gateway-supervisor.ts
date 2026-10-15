@@ -15,11 +15,11 @@
  */
 
 import { existsSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { gatewayOrigin, gatewayPort, type GatewayPluginConfig } from './config.js'
 import { defaultRuntimeDir } from './gateway-binary.js'
+import { dshHome } from './plugin-state.js'
 
 /** 探活结果。 */
 export interface HealthReport {
@@ -101,6 +101,73 @@ function isConnectionRefused(error: unknown): boolean {
   return error.name === 'TypeError' && code === undefined
 }
 
+/** 把一份 `/healthz` 的 JSON 体转成探活报告（2xx 与 503 两条路共用，字段口径只有这一处）。 */
+function toHealthReport(raw: Record<string, unknown>): HealthReport {
+  const healthy = typeof raw.healthy === 'number' ? raw.healthy : 0
+  const total = typeof raw.total === 'number' ? raw.total : 0
+  return {
+    healthy,
+    total,
+    ...typeof raw.service === 'string' ? { service: raw.service } : {},
+    ...typeof raw.realm_servable === 'object' && raw.realm_servable !== null
+      ? { realmServable: raw.realm_servable as Record<string, boolean> }
+      : {},
+    raw,
+  }
+}
+
+/** 网关服务标识（`/healthz` 的 `service` 字段）。 */
+const GATEWAY_SERVICE = 'workbuddy2api'
+
+/**
+ * 认出「**本网关**在跑、只是没有可用账号」的那种非 2xx。
+ *
+ * ## 为什么必须认（实测，不是推测）
+ *
+ * 网关没有可用账号时 `/healthz` 返回 **HTTP 503**，响应体仍是完整的健康结构：
+ *
+ * ```
+ * HTTP 503  {"healthy":0,"realm_servable":{"cn":false,"global":false},"service":"workbuddy2api","total":0}
+ * ```
+ *
+ * （仓库自己的 `docs/handoff-20260915-gateway-plugin.md` 第 268 行就记着
+ * 「网关无账号 → `/healthz` 返回 503」；2026-10-15 的从零验证逐字抓到了它。）
+ *
+ * 不认这条形态，`waitForHealth()` 会把 503 当成「还没起来」，于是：
+ *
+ * ```
+ * ① 白等满整个 30s 预算，最后报「自动启动 FAILED — 网关已拉起，但 30000ms 内
+ *    /healthz 未就绪」—— 而网关其实**正在跑**，只是没账号。用户看到的
+ *    「失败」是假的，`/wb2api-status` 的状态也会是「失败」而不是
+ *    「运行中（无可用账号）」（后者才是 `GatewayState.unhealthy` 存在的意义）。
+ * ② 端口上那个「正在跑但没账号」的网关会被判成**别的程序占用**，
+ *    `start()` 拒绝复用它 —— 而它就是我们自己的网关。
+ *
+ * ## 判定刻意严格
+ *
+ * 只认 **503 + `service: workbuddy2api` + 数值 healthy/total**。于是
+ * 「端口上是别的程序」（404、非 JSON、别的服务的 JSON）一律照旧抛错 ——
+ * 那正是这个错误存在的意义（见 `gateway-supervisor.spec.ts` 的两条用例）。
+ *
+ * @param status - HTTP 状态码。
+ * @param body - 响应体原文。
+ * @returns 探活报告；不是「本网关的 503」时 `undefined`（调用方照旧抛错）。
+ */
+export function healthReportFromUnhealthyStatus(status: number, body: string): HealthReport | undefined {
+  if (status !== 503) return undefined
+  let raw: unknown
+  try {
+    raw = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const record = raw as Record<string, unknown>
+  if (record['service'] !== GATEWAY_SERVICE) return undefined
+  if (typeof record['healthy'] !== 'number' || typeof record['total'] !== 'number') return undefined
+  return toHealthReport(record)
+}
+
 /**
  * 网关进程托管器。
  *
@@ -166,7 +233,7 @@ export class GatewaySupervisor {
    * 查找顺序（先显式配置，后推断，避免"配了却找不到"被静默忽略）：
    *  1. `binaryPath` 配置项 —— 显式指定，不存在则**直接报错**而不是继续找；
    *  2. `repoPath` 根目录及其 `bin/` 子目录下的候选名；
-   *  3. `~/.dsh/wb2api/bin/` 缓存目录（预留给按需 `go build` 的产物）；
+   *  3. `<DSH home>/wb2api/bin/` 缓存目录（插件自己的安装落点；`DSH_HOME` → `~/.dsh`）；
    *  4. 交给 `ctx.subprocess.resolveExecutable()` 走 PATH。
    *
    * @returns 可执行文件绝对路径。
@@ -193,7 +260,7 @@ export class GatewaySupervisor {
     if (repoPath.length > 0) {
       dirs.push(repoPath, join(repoPath, 'bin'))
     }
-    dirs.push(join(homedir(), '.dsh', 'wb2api', 'bin'))
+    dirs.push(join(dshHome(), 'wb2api', 'bin'))
 
     for (const dir of dirs) {
       for (const candidate of BINARY_CANDIDATES) {
@@ -242,7 +309,9 @@ export class GatewaySupervisor {
     if (workingDir.length > 0) return workingDir
     if (repoPath.length > 0) return repoPath
     // 运行目录存在（含 config.json）时优先用它，否则退回可执行文件所在目录。
-    const runtime = join(homedir(), '.dsh', 'wb2api')
+    // 基准与 `defaultRuntimeDir()` 同源（`DSH_HOME` → `~/.dsh`）：设了 `DSH_HOME`
+    // 的隔离环境里，网关的 config.json / auths/ 也在那个 home 之下。
+    const runtime = join(dshHome(), 'wb2api')
     if (existsSync(join(runtime, 'config.json'))) return runtime
     return join(argv0, '..')
   }
@@ -250,8 +319,12 @@ export class GatewaySupervisor {
   /**
    * 探活 `GET /healthz`（**该端点无需鉴权**）。
    *
+   * ★ 网关**没有可用账号**时该端点返回 **HTTP 503**（响应体仍是完整的健康结构）。
+   *   这条形态必须认出来，否则会把「正在跑、只是没账号」误判成「端口被别的程序占用」
+   *   或「还没起来」。实测后果见 {@link healthReportFromUnhealthyStatus}。
+   *
    * @returns 探活结果；端口无监听时返回 undefined。
-   * @throws 端口有监听但 `/healthz` 返回非 2xx（说明占用的不是本网关）时抛错。
+   * @throws 端口有监听、但 `/healthz` 既不是本网关的 2xx 也不是本网关的 503 时抛错。
    */
   async probe(): Promise<HealthReport | undefined> {
     let response: Response
@@ -269,6 +342,8 @@ export class GatewaySupervisor {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '')
+      const report = healthReportFromUnhealthyStatus(response.status, body)
+      if (report !== undefined) return report
       throw new Error(
         `workbuddy2api: ${this.origin} 上有服务在监听，但 /healthz 返回 HTTP ${response.status}`
         + `${body.length > 0 ? `：${body.slice(0, 200)}` : ''}。端口可能被其他程序占用。`,
@@ -282,17 +357,7 @@ export class GatewaySupervisor {
       throw new Error(`workbuddy2api: ${this.origin}/healthz 返回的不是 JSON，端口可能被其他程序占用。`)
     }
 
-    const healthy = typeof raw.healthy === 'number' ? raw.healthy : 0
-    const total = typeof raw.total === 'number' ? raw.total : 0
-    return {
-      healthy,
-      total,
-      ...typeof raw.service === 'string' ? { service: raw.service } : {},
-      ...typeof raw.realm_servable === 'object' && raw.realm_servable !== null
-        ? { realmServable: raw.realm_servable as Record<string, boolean> }
-        : {},
-      raw,
-    }
+    return toHealthReport(raw)
   }
 
   /**

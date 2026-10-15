@@ -23,8 +23,8 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { dshHome } from './plugin-state.js'
 import { extractFile, ZipError } from './zip.js'
 
 /** 下载源的默认仓库（本插件仓库的 Release，非上游）。 */
@@ -70,19 +70,27 @@ export function currentTarget(platform: string, arch: string): Target | undefine
   return { os, arch: goArch }
 }
 
-/** 默认安装目录：`~/.dsh/wb2api/bin`（同时也是 supervisor 的自动探测路径之一）。 */
+/**
+ * 默认安装目录：`<DSH home>/wb2api/bin`（同时也是 supervisor 的自动探测路径之一）。
+ *
+ * ★ 基准走 {@link dshHome}（`DSH_HOME` → `~/.dsh`），**不是**裸 `os.homedir()`：
+ * 设了 `DSH_HOME` 的隔离验证/多实例环境里，网关二进制必须落在那个 home 之下 ——
+ * 否则「干净 home」的验证会静默把 8 MB 二进制装进活体 `~/.dsh/wb2api/bin`。
+ * 未设 `DSH_HOME` 时逐字等于旧行为。
+ */
 export function defaultInstallDir(): string {
-  return join(homedir(), '.dsh', 'wb2api', 'bin')
+  return join(dshHome(), 'wb2api', 'bin')
 }
 
 /**
  * 网关运行时根目录（`config.json` / `auths/` 所在处）。
  *
- * 取安装目录的**上一级**：`~/.dsh/wb2api/`，子目录 `bin/` 只放可执行文件。
+ * 取安装目录的**上一级**：`<DSH home>/wb2api/`，子目录 `bin/` 只放可执行文件。
  * 这样「可执行文件」与「运行数据」分开，重装二进制不会碰到账号凭证。
+ * home 的口径与 {@link defaultInstallDir} 同源（`DSH_HOME` → `~/.dsh`）。
  */
 export function defaultRuntimeDir(): string {
-  return join(homedir(), '.dsh', 'wb2api')
+  return join(dshHome(), 'wb2api')
 }
 
 /**
