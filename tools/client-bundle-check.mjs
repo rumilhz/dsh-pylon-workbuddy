@@ -1,11 +1,11 @@
 /**
- * Verify the BROWSER half of dsh-workbuddy2api WITHOUT a browser (condensed C2 gate).
+ * Verify the BROWSER half of dsh-pylon-workbuddy WITHOUT a browser (condensed C2 gate).
  *
  * This is an OFFLINE gate. It never performs a real request (the stub `fetch` would
  * throw before one left), and it drives the SHIPPED code — `exports.__internals` —
  * rather than a copy of it. In order:
  *
- *   [1] `lib/client.js` parses as a CLASSIC script (that is how the page loads it):
+ *   [1] `client/client.js` parses as a CLASSIC script (that is how the page loads it):
  *       no ES-module statement, no TypeScript-only syntax.
  *   [2] `window.__ModuleLoader__.load()` is called exactly ONCE with
  *       `id === package.json name`, `dsh.client.platform === "web"`, and
@@ -45,7 +45,7 @@ import vm from 'node:vm'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
-const BUNDLE = join(ROOT, 'lib', 'client.js')
+const BUNDLE = join(ROOT, 'client', 'client.js')
 const MANIFEST = join(ROOT, 'package.json')
 
 let checks = 0
@@ -82,12 +82,19 @@ const absent = (label, haystack, needle) => {
 const esStatement = (source) => /(^|\n)\s*(import|export)\s/.exec(source)
 
 /* ────────────────── [1] parse as a classic script ────────────────── */
-section('[1] lib/client.js parses as a classic script')
+section('[1] client/client.js parses as a classic script')
 if (!existsSync(BUNDLE)) {
-  // Exit 2 is this suite's "I did not run" sentinel: tools/_run-suites.mjs turns it into
-  // a named SKIP. A missing bundle is "not run", never "passed" (see that file's rule ①).
-  console.log(`SKIP  ${BUNDLE} 不存在 —— 浏览器半边还没落地？`)
-  process.exit(2)
+  // Exit 2 ("I did not run") is GONE. It used to make tools/_run-suites.mjs print a named
+  // SKIP, and SKIP does not affect the exit code — so a missing card file produced
+  // "5 PASS · 1 SKIP" and the release job went green. That was the bug.
+  //
+  // `client/client.js` is a HAND-WRITTEN SOURCE file tracked by git, NOT a tsc artifact
+  // (tsconfig `include` is only `src/`, so nothing regenerates it). A missing bundle is
+  // therefore never "not built yet" — it is "this checkout is broken". Fail loudly.
+  bad('client/client.js exists', '手写源文件不在 —— 检出是坏的（它不是 tsc 产物，没人会重新生成）')
+  console.log('      修复：git checkout -- client/client.js')
+  console.log('\nFATAL: the browser half is missing; stopping.')
+  process.exit(1)
 }
 const source = readFileSync(BUNDLE, 'utf8')
 const bytes = statSync(BUNDLE).size
@@ -159,9 +166,13 @@ eq('load() called exactly once', registrations.length, 1)
 const registration = registrations[0] ?? {}
 eq('registration.id === package.json name', registration.id, manifest.name)
 eq('dsh.client.platform', manifest.dsh?.client?.platform, 'web')
-eq("exports['./client'].default", manifest.exports?.['./client']?.default, './lib/client.js')
+eq("exports['./client'].default", manifest.exports?.['./client']?.default, './client/client.js')
 eq("exports['./client'] resolves to this file", join(ROOT, manifest.exports?.['./client']?.default ?? ''), BUNDLE)
 truthy('package.json files[] ships lib/', (manifest.files ?? []).includes('lib'), JSON.stringify(manifest.files ?? []))
+// lib/ 是 tsc 的产物目录，client/ 是**手写源文件**目录 —— 两个都得进 files[]。
+// 原来只断言 lib/：于是「client/ 忘了加进 files[]」会让 tarball 整个少掉浏览器半边，
+// 而本闸门和其余所有离线检查依旧全绿。同族静默失效，一并钉住。
+truthy('package.json files[] ships client/', (manifest.files ?? []).includes('client'), JSON.stringify(manifest.files ?? []))
 
 /* ────────────────── [3] factory + declared externals ────────────────── */
 section('[3] factory surface and declared host modules')

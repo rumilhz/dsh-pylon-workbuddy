@@ -16,7 +16,7 @@
  * 的条目一旦带 volatile 字段，页面上就会多出**第二个**（本插件的）provider 行 ——
  * 正是这次要消除的那个。要新增配置项，请照旧保持非 volatile。
  *
- * @module dsh-workbuddy2api/config
+ * @module dsh-pylon-workbuddy/config
  */
 
 import Schema from '@deepseek-ai/schemastery'

@@ -17,7 +17,7 @@
  * 撑爆内存的文件（zip bomb）。这里不做 CRC 校验 —— 完整性由发布侧的
  * SHA256SUMS 负责（见 gateway-binary.ts），CRC 只是传输噪声检测，冗余。
  *
- * @module dsh-workbuddy2api/zip
+ * @module dsh-pylon-workbuddy/zip
  */
 
 import { inflateRawSync } from 'node:zlib'

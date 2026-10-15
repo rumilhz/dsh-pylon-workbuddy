@@ -38,7 +38,7 @@
  *    停不掉，必然命中第 1 条。
  * 3. **只改名、从不删除**。恢复 = 把 `*.json.disabled` 改回 `*.json`。
  *
- * @module dsh-workbuddy2api/accounts
+ * @module dsh-pylon-workbuddy/accounts
  */
 
 import { existsSync, readdirSync, readFileSync, renameSync } from 'node:fs'

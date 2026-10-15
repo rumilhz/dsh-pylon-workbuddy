@@ -41,7 +41,7 @@ body:
     id: plugin-version
     attributes:
       label: 插件版本
-      description: 看 `~/.dsh/profiles/<profile>/package.json` 里 dsh-workbuddy2api 的版本，或 /wb2api-status 的输出。
+      description: 看 `~/.dsh/profiles/<profile>/package.json` 里 dsh-pylon-workbuddy 的版本，或 /wb2api-status 的输出。
       placeholder: '0.3.0'
     validations:
       required: true

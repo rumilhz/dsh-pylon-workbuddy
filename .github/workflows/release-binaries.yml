@@ -198,7 +198,7 @@ jobs:
             构建所依据的上游 revision 见本工作流 `UPSTREAM_REF`（原
             `Sliverkiss/workbuddy2api` 已删库，故改用延续仓库并钉死 commit）。
 
-            通常**不需要手工下载**：dsh 插件 `dsh-workbuddy2api` 的 `/wb2api-setup`
+            通常**不需要手工下载**：dsh 插件 `dsh-pylon-workbuddy` 的 `/wb2api-setup`
             会自动取用 `releases/latest/download/` 下的产物并校验 SHA256。
 
             手工安装时请一并下载 `SHA256SUMS.txt` 校验：

@@ -8,7 +8,7 @@
  * ESM 下函数声明靠提升**确实**能转起来，但那是"恰好能跑"，不是"设计如此"：
  * `setup.ts` 至今只 import 类型，这份独立性值得保住。
  *
- * @module dsh-workbuddy2api/nickname
+ * @module dsh-pylon-workbuddy/nickname
  */
 
 /**

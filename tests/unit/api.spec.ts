@@ -284,7 +284,7 @@ describe('POST <prefix>/action { action: "rebuild" }', () => {
       keptModels: 46,
       offeredModels: 2,
       holdReason: null,
-      // 兼容别名（卡片侧 lib/client.js 读的就是这几个名字）。
+      // 兼容别名（卡片侧 client/client.js 读的就是这几个名字）。
       added: ['cn:brand-new'],
       addedCount: 1,
       keptCount: 46,

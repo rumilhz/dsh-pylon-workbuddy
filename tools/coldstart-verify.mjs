@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-workbuddy2api 冷启动验收（A3）—— 一条命令、零人工点击。
+ * dsh-pylon-workbuddy 冷启动验收（A3）—— 一条命令、零人工点击。
  *
  * 一次运行按顺序证明四件事：
  *   1. **真 DSH 进程**在一个一次性 `DSH_HOME` 里挂载本插件、拉起网关、读目录，
@@ -107,15 +107,15 @@ const GATEWAY_DIR = join(SCRATCH, 'gateway')
 const GATEWAY_CONFIG = join(GATEWAY_DIR, 'config.json')
 const DSH_CMD = 'D:\\DeepSeek Harness\\resources\\runtime\\cli\\bin\\dsh.cmd'
 const COMSPEC = process.env['ComSpec'] ?? 'cmd.exe'
-const PLUGIN_PACKAGE = 'dsh-workbuddy2api'
+const PLUGIN_PACKAGE = 'dsh-pylon-workbuddy'
 /**
- * 插件的**实例 id** —— `src/index.ts` 里 `export const name = 'workbuddy2api'`。
+ * 插件的**实例 id** —— `src/index.ts` 里 `export const name = 'pylon-workbuddy'`。
  *
  * ★ 与包名**不是**同一个字符串，这是实测踩到的坑：`cordis.patch.yml` 里
- * `- id: <x>` 覆盖的是**实例 id**，写成包名 `dsh-workbuddy2api` 时**一条也匹配不上**，
+ * `- id: <x>` 覆盖的是**实例 id**，写成包名 `dsh-pylon-workbuddy` 时**一条也匹配不上**，
  * 插件照旧用默认配置（端口 7863、namespace 自动探测），而脚本看起来"跑了"。
  */
-const PLUGIN_INSTANCE = 'workbuddy2api'
+const PLUGIN_INSTANCE = 'pylon-workbuddy'
 const PROVIDER_ID = 'workbuddy'
 const SETTINGS_NS = 'llm-pi-ai'
 
@@ -216,7 +216,7 @@ const GATEWAY_BIN = resolve(opt('gateway', DEFAULT_GATEWAY_BIN))
 const AUTHS_SRC = resolve(opt('auths', DEFAULT_AUTHS))
 
 console.log(line('='))
-console.log(`dsh-workbuddy2api 冷启动验收（自动化）  ${new Date().toISOString()}`)
+console.log(`dsh-pylon-workbuddy 冷启动验收（自动化）  ${new Date().toISOString()}`)
 console.log(line('='))
 info(`node            ${process.version}  (${process.execPath})`)
 info(`插件目录        ${PLUGIN_DIR}`)
@@ -624,7 +624,7 @@ if (!reusable) {
     console.log('🔴 插件目录在重建临时 profile 后不见了 —— 立刻中止。')
     process.exit(2)
   }
-  writeFileSync(join(PROFILE, 'cordis.yml'), '# scratch profile for the dsh-workbuddy2api cold start — an empty entry list.\n[]\n', 'utf8')
+  writeFileSync(join(PROFILE, 'cordis.yml'), '# scratch profile for the dsh-pylon-workbuddy cold start — an empty entry list.\n[]\n', 'utf8')
   writeFileSync(
     join(PROFILE, 'package.json'),
     `${JSON.stringify(
@@ -642,8 +642,8 @@ if (!reusable) {
   // 必须是**顶层 YAML 数组**（解析成 null 会被 boot 拒绝）。两条目：
   //   ① 数据面 namespace 先放一个空 `providers`，等插件把 workbuddy 写进来。
   //      它的 `name` 必须是带 scope 的真包名，不带 scope 会在解析期直接报错。
-  //   ② `- id: workbuddy2api` 覆盖**实例配置**。★ 这里的 `id` 是**实例 id**
-  //      （= 插件包里 `export const name`，**不是**包名 `dsh-workbuddy2api`）：
+  //   ② `- id: pylon-workbuddy` 覆盖**实例配置**。★ 这里的 `id` 是**实例 id**
+  //      （= 插件包里 `export const name`，**不是**包名 `dsh-pylon-workbuddy`）：
   //      写成包名等于什么也没覆盖（本脚本第一版就是这么错的）。
   //   ★ **不要**再手写 `- insert:` —— profile 的 `dsh.profile.bundles` 已经把插件
   //     挂进组合，插件的 `cordis.patch.yml` 也自带一条 insert；再写一条实测会让插件

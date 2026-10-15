@@ -18,7 +18,7 @@
  *    `GatewaySupervisor.resolveBinary()` 的第 3 个查找位置），绝不覆盖用户已有的
  *    `repoPath` 构建产物 —— 那可能是他自己编译的、带本地补丁的版本。
  *
- * @module dsh-workbuddy2api/gateway-binary
+ * @module dsh-pylon-workbuddy/gateway-binary
  */
 
 import { createHash, randomBytes } from 'node:crypto'

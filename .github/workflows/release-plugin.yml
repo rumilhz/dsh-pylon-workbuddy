@@ -61,11 +61,13 @@ jobs:
           test -f lib/gateway-binary.js
           test -f lib/login.js
           test -f lib/setup.js
-          # 设置卡片的两半：宿主路由 + 浏览器 bundle。
+          # 设置卡片的两半：宿主路由（lib/，tsc 产物）+ 浏览器半边（client/，手写源文件）。
           # 缺了它们插件照样能跑（卡片不出现），所以【必须】在这里挡住，
           # 否则会发出一个「没有卡片的版本」而 CI 全绿。
+          # ★ client/ 不是构建产物：tsconfig 的 include 只有 src/，没人会重新生成它 ——
+          #   它要是没进检出，下面这行就是唯一的报警器。
           test -f lib/api.js
-          test -f lib/client.js
+          test -f client/client.js
           # 墓碑状态与启动轨迹：缺了会静默降级，同样值得挡住。
           test -f lib/plugin-state.js
           test -f lib/boot-trace.js
@@ -104,8 +106,13 @@ jobs:
           grep -q 'package/cordis.patch.yml' /tmp/contents.txt
           grep -q 'package/lib/index.js' /tmp/contents.txt
           # 设置卡片的浏览器半边必须打进包 —— 否则发出去的是「没有卡片的版本」。
-          grep -q 'package/lib/client.js' /tmp/contents.txt
+          grep -q 'package/client/client.js' /tmp/contents.txt
           grep -q 'package/lib/api.js' /tmp/contents.txt
+          # 反向断言：files[] 同时含 lib 与 client 时，若还有一份 lib/client.js 残留在
+          # 构建目录里，tarball 会把它一起打进去 —— 两份"浏览器半边"谁生效说不清。
+          if grep -q 'package/lib/client.js' /tmp/contents.txt; then
+            echo "::error::tarball 里不应再有 lib/client.js（与 client/client.js 重复）"; exit 1
+          fi
           if grep -q 'package/src/' /tmp/contents.txt; then
             echo "::error::tarball 里不应包含 src/"; exit 1
           fi

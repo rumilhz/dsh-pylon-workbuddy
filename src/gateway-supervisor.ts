@@ -11,7 +11,7 @@
  *     即使有响应也可能是 `healthy: 0`。因此探活必须解析 `healthy` / `total`，
  *     而不能只看 HTTP 200。
  *
- * @module dsh-workbuddy2api/gateway-supervisor
+ * @module dsh-pylon-workbuddy/gateway-supervisor
  */
 
 import { existsSync, readdirSync } from 'node:fs'

@@ -43,7 +43,7 @@
  * 只有验收脚本会清空它（重建临时 profile 时）；生产环境从不自动清空 ——
  * 否则「上一次启动发生了什么」正好会在最需要它的时候被这一次抹掉。
  *
- * @module dsh-workbuddy2api/boot-trace
+ * @module dsh-pylon-workbuddy/boot-trace
  */
 
 import { appendFileSync, mkdirSync } from 'node:fs'

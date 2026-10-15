@@ -1,5 +1,5 @@
 {
-  "name": "dsh-workbuddy2api",
+  "name": "dsh-pylon-workbuddy",
   "version": "0.4.0",
   "description": "DeepSeek Harness plugin: supervise a local workbuddy2api gateway process and write its models into an editable llm-pi-ai provider",
   "type": "module",
@@ -11,12 +11,13 @@
       "default": "./lib/index.js"
     },
     "./client": {
-      "default": "./lib/client.js"
+      "default": "./client/client.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "client",
     "cordis.patch.yml",
     "scripts",
     "README.md",
@@ -24,6 +25,7 @@
   ],
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "cordis",
     "plugin",

@@ -15,7 +15,7 @@
  * 0.3.x 的架构，只在 `registerOwnProvider: true` 的回退路径上启用 —— 那条路径下
  * 模型目录由适配器直连 `/v1/models` 提供，代价是它在「设置 → 模型」里永远不可编辑。
  *
- * @module dsh-workbuddy2api
+ * @module dsh-pylon-workbuddy
  */
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -165,7 +165,7 @@ export { maskNickname } from './nickname.js'
 console.log('[workbuddy2api] module loaded')
 
 /** 插件实例 id。必须与 `cordis.patch.yml` 里的 `id` 一致。 */
-export const name = 'workbuddy2api'
+export const name = 'pylon-workbuddy'
 
 /**
  * 依赖的服务。

@@ -6,7 +6,7 @@
  * `reader.read()` 会无限期挂起 —— 适配器的 generator 永不返回，当前步骤既不出
  * 结果也不报错。主动超时并把失败归类为可重试的 `TIMEOUT`，dsh 才能重试该步骤。
  *
- * @module dsh-workbuddy2api/sse
+ * @module dsh-pylon-workbuddy/sse
  */
 
 import { LlmError } from '@deepseek-ai/dsh-llm'

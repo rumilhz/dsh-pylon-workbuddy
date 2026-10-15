@@ -26,7 +26,7 @@
  * 不存在"某个域的窗口是占位值"的历史差别。旧版本网关曾把 `global:` 的
  * `context_length` 硬编码为 131072 且不下发 `max_output_tokens`，上游已修复。
  *
- * @module dsh-workbuddy2api/models
+ * @module dsh-pylon-workbuddy/models
  */
 
 /**

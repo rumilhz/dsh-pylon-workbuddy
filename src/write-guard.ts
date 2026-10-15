@@ -32,7 +32,7 @@
  * 覆盖两种形态。DSH 的 HMR 监听 profile patch（`dsh-hmr/lib/index.js:354`），
  * 所以盖回文件即触发热加载；万一没触发，重启即可。
  *
- * @module dsh-workbuddy2api/write-guard
+ * @module dsh-pylon-workbuddy/write-guard
  */
 
 import { copyFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'

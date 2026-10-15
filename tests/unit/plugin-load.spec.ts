@@ -81,7 +81,7 @@ describe.skipIf(!hasKernel())('插件装载（真实 cordis + dsh-llm）', () =>
   })
 
   it('插件导出面符合 dsh 插件契约', () => {
-    expect(plugin.name).toBe('workbuddy2api')
+    expect(plugin.name).toBe('pylon-workbuddy')
     expect(plugin.inject).toEqual(['llm', 'subprocess', 'commands'])
     expect(typeof plugin.apply).toBe('function')
   })

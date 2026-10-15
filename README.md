@@ -1,6 +1,10 @@
-# dsh-workbuddy2api
+# dsh-pylon-workbuddy
 
 **把 [workbuddy2api](https://github.com/HanawaBanana/workbuddy2api) 网关接进 [DeepSeek Harness（dsh）](https://www.npmjs.com/package/@deepseek-ai/dsh) 的插件。**
+
+> 包名 `dsh-pylon-workbuddy`（家族前缀 `dsh-pylon-`）。旧名 `dsh-workbuddy2api` 只作为历史
+> 出现在下面的「npm registry」告警与本仓库的 GitHub 地址里 —— 那是**仓库地址**与**已弃用的旧包名**，
+> 不是当前包名。
 
 装上之后：
 
@@ -119,17 +123,17 @@ llm-pi-ai:                    ← profile 条目，settings namespace
 **不需要先下载文件** —— pnpm 支持直接以 Release 的 tarball URL 作为依赖（已实测：装出来是真实目录、非 `link:`）：
 
 ```bash
-dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/releases/download/v0.4.0/dsh-workbuddy2api-0.4.0.tgz
+dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/releases/download/v0.4.0/dsh-pylon-workbuddy-0.4.0.tgz
 ```
 
 升级时把 URL 里的版本号换掉即可。
 
 ### 方式二：先下载再本地安装
 
-在 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases/latest) 下载 `dsh-workbuddy2api-<版本>.tgz`，然后：
+在 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases/latest) 下载 `dsh-pylon-workbuddy-<版本>.tgz`，然后：
 
 ```bash
-dsh plugin --profile web add file:/绝对路径/dsh-workbuddy2api-0.4.0.tgz
+dsh plugin --profile web add file:/绝对路径/dsh-pylon-workbuddy-0.4.0.tgz
 ```
 
 ### 方式三：从源码安装
@@ -140,26 +144,30 @@ cd dsh-workbuddy2api
 npm install
 node node_modules/typescript/bin/tsc -p tsconfig.json   # 必须先构建出 lib/
 npm pack --pack-destination dist
-dsh plugin --profile web add file:./dist/dsh-workbuddy2api-0.4.0.tgz
+dsh plugin --profile web add file:./dist/dsh-pylon-workbuddy-0.4.0.tgz
 ```
 
 > **不要用 `dsh plugin install <源码目录>`**：pnpm 会写成 `link:` 依赖，而 Windows 上工具进程创建的 junction 不可遍历，会导致 pnpm 全面失效。用 `npm pack` / `pnpm pack` 出的 tarball（解包成真实目录）可规避。
 
-> **关于 npm registry（重要，别装错）**：npm 上的 **`dsh-workbuddy2api` 这个包名已被他人占用**
+> **关于旧包名与 npm registry（重要，别装错）**：本插件的**当前包名是 `dsh-pylon-workbuddy`**
+> （家族前缀 `dsh-pylon-`），它替换掉了旧的 `dsh-workbuddy2api`。
+>
+> 而 npm 上的 **`dsh-workbuddy2api` 这个旧名已被他人占用**
 > —— 发布者是 [Boiser](https://www.npmjs.com/~boiser)，线上版本为 `0.4.9` ~ `0.6.8`（`latest = 0.6.8`），
 > 与本仓库（`tearslee/dsh-workbuddy2api`，当前 `0.4.0`）**不是同一个项目**。
 >
-> ⚠️ **两边从 `0.4.x` 起版本号会撞车，别再靠版本号区分**：本仓库从 `0.4.0` 进入这条线，
-> npm 上那个同名包也停在 `0.4.9` ~ `0.6.8`。**唯一可靠的区分方式是来源（URL / tarball）。**
+> ⚠️ **版本号也不能用来区分**：本仓库从 `0.4.0` 进入这条线，npm 上那个旧名包也停在
+> `0.4.9` ~ `0.6.8`。**唯一可靠的区分方式是来源（URL / tarball）。**
 >
 > 因此：
 >
-> - ❌ **不要执行 `dsh plugin add dsh-workbuddy2api`** —— 它会装到那个同名包，而不是本插件；
-> - ✅ 请用上面三种方式之一，从**本仓库的 GitHub Release** 取 `dsh-workbuddy2api-<版本>.tgz`；
+> - ❌ **不要执行 `dsh plugin add dsh-workbuddy2api`** —— 旧名已被占用，它会装到别人的包，而不是本插件；
+> - ✅ 请用上面三种方式之一，从**本仓库的 GitHub Release** 取 `dsh-pylon-workbuddy-<版本>.tgz`；
 > - 装完请核对**来源**：本仓库的版本线是 `0.1.x` / `0.3.x` / `0.4.x`，且只从
 >   `github.com/tearslee/dsh-workbuddy2api` 的 Release 分发。
 >
-> 本仓库未在 npm 发布，也无意与同名包竞争该名称 —— 安装时**认 URL / 认 tarball**，不要只认包名。
+> 本仓库未在 npm 发布。新名 `dsh-pylon-workbuddy` 在 2026-10-15 核对时尚未被占用
+> （registry 返回 404），但**是否发布取决于后续决定** —— 安装时**认 URL / 认 tarball**，不要只认包名。
 
 ### 装完必须重启一次 dsh（为什么）
 
@@ -193,12 +201,12 @@ dsh 起来之后，在对话里执行：
 
 ## 配置
 
-插件配置写在 profile 的 `cordis.patch.yml` 里（或任何引用 `id: workbuddy2api` 的补丁）。全部字段都可省略：
+插件配置写在 profile 的 `cordis.patch.yml` 里（或任何引用 `id: pylon-workbuddy` 的补丁）。全部字段都可省略：
 
 ```yaml
 - insert:
-    - id: workbuddy2api
-      name: 'dsh-workbuddy2api'
+    - id: pylon-workbuddy
+      name: 'dsh-pylon-workbuddy'
       config:
         baseURL: http://127.0.0.1:7863/v1
         binaryPath: /path/to/workbuddy2api/wb2a-server.exe

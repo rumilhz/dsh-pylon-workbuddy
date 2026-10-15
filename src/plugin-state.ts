@@ -40,7 +40,7 @@
  *   落盘用 `writeFileSync(path, text, 'utf8')`。写失败**抛给调用方**，由它决定
  *   怎么在结果里注明 —— 但绝不因此影响 provider 配置本身的写入。
  *
- * @module dsh-workbuddy2api/plugin-state
+ * @module dsh-pylon-workbuddy/plugin-state
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'

@@ -1,6 +1,6 @@
 # 轮级聚合：让一次对话只有一个 RequestID
 
-> 本文是 [dsh-workbuddy2api](../README.md) 的背景说明，解释两件事：上游
+> 本文是 [dsh-pylon-workbuddy](../README.md) 的背景说明，解释两件事：上游
 > RequestID 碎片化问题是怎么修的，以及插件为什么必须按现在这种方式序列化消息。
 
 ## 问题长什么样

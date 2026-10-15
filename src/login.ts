@@ -25,7 +25,7 @@
  * `expiresAt` 是 **Unix 秒**（网关契约 `internal/auth/auth.go` 的 `ExpiresAt int64`），
  * 不是毫秒 —— 写错单位会让网关判成「永不过期」而永不刷新。
  *
- * @module dsh-workbuddy2api/login
+ * @module dsh-pylon-workbuddy/login
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'

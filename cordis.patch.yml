@@ -1,5 +1,6 @@
-# dsh-workbuddy2api 配置包补丁：在空配置根上追加插件行。
-# 后续配置补丁可通过 id 引用此行（id: workbuddy2api）。
+# dsh-pylon-workbuddy 配置包补丁：在空配置根上追加插件行。
+# 后续配置补丁可通过 id 引用此行（id: pylon-workbuddy）。
+# ★ id 是**实例 id**（= src/index.ts 的 export const name），不是包名；两者必须同时正确。
 - insert:
-    - id: workbuddy2api
-      name: 'dsh-workbuddy2api'
+    - id: pylon-workbuddy
+      name: 'dsh-pylon-workbuddy'

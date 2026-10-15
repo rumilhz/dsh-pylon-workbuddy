@@ -61,7 +61,7 @@
  * 判定与恢复的实现见 `write-guard.ts`；判定规则本身是纯函数，因为它恰恰是
  * "只在事故当天才起作用、因而最容易悄悄退化"的那部分。
  *
- * @module dsh-workbuddy2api/provider-config
+ * @module dsh-pylon-workbuddy/provider-config
  */
 
 import type { GatewayCatalogEntry } from './models.js'

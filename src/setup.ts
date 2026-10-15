@@ -31,7 +31,7 @@
  * 2. **永不覆盖用户已有的二进制**：只往插件自己的缓存目录装（见 gateway-binary.ts）。
  * 3. **可重复执行**：第二次跑会直接从第一个未满足的条件继续，不重复已完成的工作。
  *
- * @module dsh-workbuddy2api/setup
+ * @module dsh-pylon-workbuddy/setup
  */
 
 import { existsSync } from 'node:fs'

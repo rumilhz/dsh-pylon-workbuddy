@@ -11,7 +11,7 @@
  * 因为没有 OAuth / 签名 / token 续期 / 多账号，这里不需要 codearts 那套
  * `resolveCredential` / `refresh` / `AccountPool` 机制 —— api_key 固定，直接读凭据即可。
  *
- * @module dsh-workbuddy2api/gateway-adapter
+ * @module dsh-pylon-workbuddy/gateway-adapter
  */
 
 import {

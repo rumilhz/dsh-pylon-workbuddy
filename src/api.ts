@@ -26,7 +26,7 @@
  * 2. **不许有隐式动作**：`/panel` 是纯只读的（只发 GET）；只有 `/action` 会改变状态，
  *    而 `test` 还必须额外带 `confirm: true` —— 它会真的花额度。
  *
- * @module dsh-workbuddy2api/api
+ * @module dsh-pylon-workbuddy/api
  */
 
 import { gatewayOrigin } from './config.js'
@@ -550,7 +550,7 @@ export function createPanelApi(deps: PanelApiDeps): PanelApi {
  * `addedModelIds` / `offeredModelIds` —— 只说个数不够，排障时要看到是哪些 id。
  *
  * ★ 另外还给了 `added` / `addedCount` / `keptCount` / `modelCount` 这几个**别名**：
- * 卡片侧（`lib/client.js` 的 `actRebuild`）按这几个名字读，而两侧是并行开发的。
+ * 卡片侧（`client/client.js` 的 `actRebuild`）按这几个名字读，而两侧是并行开发的。
  * 与其让一边改，不如这一侧多给几个键 —— 多给的键对任何消费者都无害，
  * 缺一个键却会让卡片只剩一句 detail。
  */

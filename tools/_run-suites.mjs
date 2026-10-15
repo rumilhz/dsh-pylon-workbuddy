@@ -82,9 +82,14 @@ const CLI_SKIP =
  * 上会把盘符当普通目录名拼起来，于是"入口不存在"会假报成"依赖没装"）。
  * 闸门脚本被删/改名时，这里显式记 SKIP —— 见文件头规矩①。
  *
- * 额外认一个哨兵：闸门自己也没法预知自己会不会被删，万一它在运行期发现
- * `lib/client.js` 不在，会以退出码 2 结束（stdout 里带 SKIP）；这一行把那个 2 翻译成
- * 同样的 SKIP，而不是 FAIL —— 缺文件是"没跑"，不是"跑挂了"。
+ * 哨兵 2 已废除。闸门在运行期发现 `client/client.js` 不在时，现在**直接以退出码 1 失败**。
+ * 理由：那是被 git 跟踪的**手写源文件**，丢了就是坏检出，不是"还没落地"。
+ * 原来那个 2 ⇒ SKIP 的翻译正是本次发布阻塞的根源 —— 缺了卡片文件，套件显示
+ * 「5 PASS · 1 SKIP」，而 SKIP 不影响退出码，于是发布闸门全绿。
+ *
+ * 注意区分（两者不再混为一谈）：
+ *   · 套件**入口**不存在（依赖没装、工具没提供）⇒ 仍然是 SKIP，见规矩①；
+ *   · 已经跑起来的套件**非 0 退出** ⇒ 一律 FAIL。
  */
 const CLIENT_SKIP =
   !existsSync(join(ROOT, CLIENT_CHECK)) ? `${CLIENT_CHECK} 不存在（浏览器半边未提供？）`
@@ -107,12 +112,12 @@ const SUITES = [
     ['run', '--config', E2E_CONFIG, SPEC_CLI],
     { skip: CLI_SKIP },
   ],
-  // 浏览器半边（设置卡片 lib/client.js）的离线闸门：不用浏览器就能证明它是经典脚本、
+  // 浏览器半边（设置卡片 client/client.js）的离线闸门：不用浏览器就能证明它是经典脚本、
   // id 严格等于包名、两个席位/四个 key、双前缀只在"不是 JSON"时才换、四种状态都能渲染、
   // 且签到/重建清单/测试模型三个按钮都只在点了之后才发请求。
   // 入口见上面 CLIENT_SKIP 的说明。
   [
-    'client bundle 离线闸门 (lib/client.js 加载契约 + 双前缀 + 四状态)',
+    'client bundle 离线闸门 (client/client.js 加载契约 + 双前缀 + 四状态)',
     CLIENT_LAUNCH,
     [],
     { skip: CLIENT_SKIP },
@@ -178,12 +183,13 @@ for (const [label, entry, args = [], options = {}] of SUITES) {
     windowsHide: true,
   })
   const elapsed = clock(Date.now() - started)
-  // 退出码 2 = 套件自己说"我没跑"（见 CLIENT_SKIP 的第二段说明）：缺入口是 SKIP，不是 FAIL。
-  if (run.status === 2) {
-    results.push({ label, status: 'SKIP', detail: '套件自报未运行（缺入口）' })
-    console.log(`SKIP  ${label}  (套件自报未运行（缺入口）)`)
-    continue
-  }
+  // 哨兵 2（"套件自报未运行"）已废除，见文件头 CLIENT_SKIP 段。它唯一的产出是让
+  // "卡片文件 client/client.js 不在"变成一条不影响退出码的 SKIP —— 发布闸门因此全绿地
+  // 发出一个没有卡片的版本。缺失的**入口**仍由上面的 existsSync / `{ skip }` 记 SKIP
+  // （那是"依赖没装"，不是"检出坏了"），两者不再混为一谈。
+  //
+  // 顺带堵掉一个同族隐患：`tsc -p tsconfig.json`（emit 模式）在"有诊断但产物已生成"时
+  // 退出码正是 2 —— 原来那一支会把一个**有编译错误**的构建报成 SKIP。
   const ok = run.status === 0 // 只看退出码；status 为 null（超时/起不来）自然算 FAIL
   const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
   const source = output.trim() === '' && run.error !== undefined ? run.error.message : output
