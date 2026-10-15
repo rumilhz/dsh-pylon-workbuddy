@@ -28,7 +28,34 @@ const VERSION = '0.1.0'
 // ── 参数解析（骨架照抄 插件/dsh-trae/tools/trae.ts:25-33）────────────────────
 const argv = process.argv.slice(2)
 const command = argv.find((value) => !value.startsWith('-')) ?? 'status'
-const flag = (name) => argv.includes(`--${name}`)
+
+/**
+ * 短别名表 —— **只有帮助文本里真的承诺过的选项**才登记在这里。
+ *
+ * 为什么不写成"凡是 `--x` 就也认 `-x`"：短别名在 CLI 里从来不是通用的
+ * （`--json` 没有 `-j`，`--yes` 没有 `-y`，`--force` 没有 `-f`），一律放行等于
+ * 凭空发明一批没人承诺过的拼写，还会把本该报错的手滑输入变成静默生效。
+ *
+ * 目前唯一一条 `help → h` 就是帮助里写着 `--help, -h` 的那一对。加它之前
+ * `-h` 不在 argv 里匹配任何 flag ⇒ 掉进默认命令 `status`，去拨活体网关
+ * （2026-10-15 在真 Linux 上实测：`-h --config <不存在>` 退出码 1）。
+ *
+ * 对**既有 `--` 行为零影响**：没有登记的 name 走的就是原来那一条
+ * `argv.includes('--' + name)`，逐字未变。
+ */
+const SHORT_ALIASES = { help: 'h' }
+
+// 表本身的自检：短别名只能是「单横线 + 单字符」。写错了在启动时就炸，
+// 而不是变成一个谁都看不出来的 `--config` 也能写成 `-config` 的隐性接口。
+for (const [name, short] of Object.entries(SHORT_ALIASES)) {
+  if (short.length !== 1) throw new Error(`短别名表写错了：--${name} 的别名 -${short} 不是单字符`)
+}
+
+const flag = (name) => {
+  if (argv.includes(`--${name}`)) return true
+  const short = SHORT_ALIASES[name]
+  return short !== undefined && argv.includes(`-${short}`)
+}
 const option = (name) => {
   const index = argv.indexOf(`--${name}`)
   return index === -1 ? undefined : argv[index + 1]
@@ -491,7 +518,8 @@ function printHelp() {
   --origin <url>             覆盖网关地址（默认读 config.json 的 listen，即 http://127.0.0.1:7863）
   --config <path>            覆盖 config.json 路径
   --json                     输出原始 JSON（models / usage）
-  --help, -h                 显示本帮助
+  --help, -h                 显示本帮助（**唯一**带短别名的选项：--json / --yes /
+                             --force 都只有长写法，写 -j / -y / -f 不认）
 
 test 的选项（唯一会花钱的命令）
   --model <id>               必需。要测的模型 id（models 命令里那一列）

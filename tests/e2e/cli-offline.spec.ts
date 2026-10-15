@@ -2,52 +2,103 @@
  * `tools/wb2api.mjs`（独立 CLI，不经 dsh 插件）的**离线**契约。
  *
  * 这个文件存在的起因很具体：那个 CLI 是独立于插件的第二入口，不在 `tests/unit/**`
- * 的覆盖里，于是它可以被改坏而**全绿套件一个字都不说**。这里只钉住三条**不发请求**
- * 的行为 —— 参数校验与退出码，也就是"人和脚本都靠它判断下一步"的那一层：
+ * 的覆盖里，于是它可以被改坏而**全绿套件一个字都不说**。这里只钉住**不该发请求**的
+ * 行为 —— 参数校验与退出码，也就是"人和脚本都靠它判断下一步"的那一层：
  *
- *   ① `--help` ⇒ 0；
+ *   ① `--help` / `-h` ⇒ 0，而且**根本不读 config**；
  *   ② 未知命令 ⇒ 2（用法错，与"网关不可达"的 1 分开）；
- *   ③ `test` 缺 `--model` ⇒ 2，且**在联网之前就返回**。
+ *   ③ `test` 缺 `--model` ⇒ 2，且在联网之前就返回；
+ *   ④ `test` 的两道成本闸（模型不在目录里 / 没给 `--yes`）⇒ 2，
+ *      且**一条会花额度的请求都没发**。
  *
- * ③ 是最要紧的一条：`test` 是那个 CLI 里**唯一会花额度**的命令，而"缺参数"必须在
- * 拨号之前就被拦住 —— 否则一次笔误就是一次真实消费。这里的断言方式就是**不给它任何
- * 可达的网关**（见下），所以万一它真的尝试联网，得到的是连接失败 ⇒ 退出码 1 ⇒ 断言红。
+ * ③ ④ 是最要紧的：`test` 是那个 CLI 里**唯一会花额度**的命令，而"缺参数"与"闸门"
+ * 必须在拨号之前就被拦住 —— 否则一次笔误就是一次真实消费。
  *
- * **离线性是构造出来的，不是假设的**：三条断言全部走 `--config <临时文件>`，指向一个
- * 只存在于本次测试临时目录里的 config.json（`listen` 指向一个必然连不上的端口）。
- * 这样既不依赖本机 `~/.dsh/wb2api/config.json` 是否存在（CI 上没有 ⇒ 会变成退出码 1
- * 而不是 2，把一条环境差异伪装成失败），也不会碰到真实网关。
+ * ## 离线性是构造出来的，不是假设的（2026-10-15 修掉一轮假绿）
+ *
+ *   · 所有断言都走 `--config <临时文件>`，指向只存在于本次临时目录里的 config.json。
+ *     这样既不依赖本机 `~/.dsh/wb2api/config.json` 是否存在（CI 上没有 ⇒ 会变成退出码
+ *     1 而不是 2，把一条环境差异伪装成失败），也不会碰到真实网关。
+ *
+ *   · 帮助那两条**以前没带 `--config`**（走本机默认配置）。本机默认配置里
+ *     `listen=127.0.0.1:7863` 且网关活着、key 是真的 ⇒ 断言"要么绿、要么被真网关救活"：
+ *     `-h` 当时**不是**一个被认出的 flag，于是 `command` 落到默认值 `status`，
+ *     真去打了一趟活体网关，**退出 0** ⇒ `-h ⇒ 0` 绿了，而 `-h` 本身是坏的
+ *     （同一天在真 Linux 上实测：`-h --config <不存在>` 退出 1）。
+ *     现在两条都带 config，并且额外用"config 根本不存在"再跑一遍：帮助路径若真去读
+ *     配置，那里必然退 1。
+ *
+ *   · 成本闸那两条**以前指向死端口** ⇒ 进程在"网关不可达"那一步就退 1，**根本走不到
+ *     闸门**（把那两道闸整个删掉，那两条照样绿）。现在起一个**本地假网关**回答目录，
+ *     才能把"拒绝发那条会花额度的消息"钉在**成本闸**上，而不是钉在"连不上"上。
  *
  * 为什么断言的是**退出码**而不是输出文本：退出码才是 `_run-suites.mjs` 与 shell 脚本
- * 依赖的契约。文案可以改，退出码不能。
+ * 依赖的契约，文案可以改，退出码不能。个别地方连文本一起钉，是因为**只**看退出码
+ * 分不出"打了帮助"与"打了网关"（两者都可能是 0）。
  */
 
-import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const HERE = import.meta.dirname
 const ROOT = join(HERE, '..', '..')
 const CLI = join(ROOT, 'tools', 'wb2api.mjs')
+const execFileAsync = promisify(execFile)
 
-/** 一个**必然连不上**的网关地址：断言③若真去拨号，会以退出码 1 失败而不是静默变绿。 */
+/** 一个**必然连不上**的网关地址：走到拨号的断言会以退出码 1 失败，而不是静默变绿。 */
 const DEAD_ORIGIN = '127.0.0.1:9'
 
-let tempDir: string
-let configPath: string
+/** 假网关目录里那个**免费**模型：它的存在让流程能走到 `--yes` 那道闸。 */
+const FREE_MODEL_ID = 'cn:fixture-free'
 
-beforeAll(() => {
+/** 帮助文本里唯一那句只可能出现在帮助里的特征串（status 输出里没有它）。 */
+const HELP_MARKER = '用法：'
+
+const API_KEY = 'fixture-key-not-a-real-credential'
+
+let tempDir: string
+/** 指向死端口的 config：用来构造"网关不可达"的环境。 */
+let deadConfigPath: string
+/** 指向本地假网关的 config：只在成本闸那两条里用。 */
+let fakeConfigPath: string
+
+/** 假网关收到的每一次请求（按到达顺序）—— 断言"一条花额度的请求都没发"就靠它。 */
+const gatewayHits: Array<{ method: string; url: string }> = []
+let gateway: Server
+
+beforeAll(async () => {
   tempDir = mkdtempSync(join(tmpdir(), 'wb2api-cli-'))
-  configPath = join(tempDir, 'config.json')
-  writeFileSync(configPath, JSON.stringify({
-    listen: DEAD_ORIGIN,
-    api_key: 'fixture-key-not-a-real-credential',
-  }))
+  deadConfigPath = join(tempDir, 'config.json')
+  writeFileSync(deadConfigPath, JSON.stringify({ listen: DEAD_ORIGIN, api_key: API_KEY }))
+
+  // 本地假网关：只回答 /v1/models 目录（含一个免费模型），其余路径也回一段 JSON ——
+  // 若哪天真有被测代码走到 /chat/completions，那是"发出了一条会花钱的消息"，
+  // 由 gatewayHits 上的断言抓住，而不是靠这里的响应内容。
+  gateway = createServer((request, response) => {
+    const url = request.url ?? ''
+    gatewayHits.push({ method: request.method ?? '', url })
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(url.endsWith('/v1/models')
+      ? JSON.stringify({ data: [{ id: FREE_MODEL_ID, name: 'fixture', credits: 'x0.00' }] })
+      : JSON.stringify({ choices: [{ message: { role: 'assistant', content: '不该被调用' } }] }))
+  })
+  await new Promise<void>((resolve) => { gateway.listen(0, '127.0.0.1', () => resolve()) })
+  const { port } = gateway.address() as AddressInfo
+  fakeConfigPath = join(tempDir, 'fake-gateway.json')
+  writeFileSync(fakeConfigPath, JSON.stringify({ listen: `127.0.0.1:${port}`, api_key: API_KEY }))
 })
 
-afterAll(() => {
+afterAll(async () => {
+  // close() 会等既有连接自然结束，而 undici 的 keep-alive 连接不会自己关 ⇒ 先掐连接，
+  // 否则这条钩子会挂到 hookTimeout。
+  gateway.closeAllConnections()
+  await new Promise<void>((resolve) => { gateway.close(() => resolve()) })
   try {
     rmSync(tempDir, { recursive: true, force: true })
   } catch {
@@ -56,55 +107,100 @@ afterAll(() => {
 })
 
 /**
- * 跑一次 CLI 并拿回退出码 + 输出。
+ * 跑一次 CLI 并拿回退出码 + 输出（0 与非 0 都走同一条返回路径）。
  *
- * `timeout` 是必须的：这三条本该**立即**返回，若哪天有人在参数校验之前插了网络调用，
- * 这里要的是"快速失败"，而不是让整个套件挂死到超时。
+ * ⚠️ 必须用**异步**的 `execFile`，不能图省事写 `spawnSync`：同步版会把本测试进程的
+ * 事件循环钉住，于是本进程里那个**假网关一个请求都处理不了** —— 被测 CLI 会一直等到
+ * 自己的 20s 超时，跑出"网关不可达"的假失败（2026-10-15 实测踩过这一脚）。
+ *
+ * `timeout` 也不能省：这些断言本该**立即**返回，若哪天有人在参数校验之前插了网络调用，
+ * 这里要的是"快速失败"（超时被杀 ⇒ status 为 null ⇒ 断言红），而不是让套件挂死。
  */
-function runCli(args: string[]): { status: number | null; output: string; signal: NodeJS.Signals | null } {
-  const run = spawnSync(process.execPath, [CLI, ...args], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    timeout: 30_000,
-    windowsHide: true,
-  })
-  return { status: run.status, output: `${run.stdout ?? ''}${run.stderr ?? ''}`, signal: run.signal }
+async function runCli(args: string[]): Promise<{ status: number | null; output: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [CLI, ...args], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      timeout: 30_000,
+      windowsHide: true,
+    })
+    return { status: 0, output: `${stdout}${stderr}` }
+  } catch (error) {
+    const failure = error as { code?: number | string; stdout?: string; stderr?: string }
+    return {
+      status: typeof failure.code === 'number' ? failure.code : null,
+      output: `${failure.stdout ?? ''}${failure.stderr ?? ''}`,
+    }
+  }
 }
 
 describe('tools/wb2api.mjs：离线契约（不发请求）', () => {
-  it('--help ⇒ 退出 0', () => {
-    const { status, output } = runCli(['--help'])
+  it('--help ⇒ 退出 0，且打的是帮助', async () => {
+    const { status, output } = await runCli(['--help', '--config', deadConfigPath])
     expect(status).toBe(0)
     // 帮助里必须能看到各命令与退出码表 —— 否则"帮助"帮不了人。
     expect(output).toContain('status')
     expect(output).toContain('models')
     expect(output).toContain('usage')
     expect(output).toContain('test')
+    // 退出码 0 也可能是"打了网关"（网关活着时 status 也退 0）⇒ 用帮助独有的那行区分。
+    expect(output).toContain(HELP_MARKER)
   })
 
-  it('-h ⇒ 退出 0（与 --help 同一条路）', () => {
-    expect(runCli(['-h']).status).toBe(0)
+  it('-h ⇒ 退出 0（与 --help 同一条路，不是"掉进 status"）', async () => {
+    // 这条曾经是假绿：`-h` 没被认出来 ⇒ command 落到默认值 status ⇒ 去拨本机活体网关
+    // （7863，真 key）⇒ 退出 0。于是它在开发机永远绿，在真 Linux 上必红。
+    const { status, output } = await runCli(['-h', '--config', deadConfigPath])
+    expect(status).toBe(0)
+    expect(output).toContain(HELP_MARKER)
   })
 
-  it('未知命令 ⇒ 退出 2（用法错，不是"网关不可达"的 1）', () => {
-    const { status, output } = runCli(['definitely-not-a-command', '--config', configPath])
+  it('帮助路径压根不读 config：--config 指向不存在的文件也退 0', async () => {
+    // 比"死端口"更狠的一刀：死端口只证明"没拨通"，这条证明**连配置都没去读**。
+    const missing = join(tempDir, 'definitely-missing.json')
+    for (const arg of ['--help', '-h']) {
+      const { status, output } = await runCli([arg, '--config', missing])
+      expect(status, `${arg} 去读了 config（应该直接打帮助）`).toBe(0)
+      expect(output).toContain(HELP_MARKER)
+    }
+  })
+
+  it('未知命令 ⇒ 退出 2（用法错，不是"网关不可达"的 1）', async () => {
+    const { status, output } = await runCli(['definitely-not-a-command', '--config', deadConfigPath])
     expect(status).toBe(2)
     expect(output).toContain('definitely-not-a-command')
   })
 
-  it('test 缺 --model ⇒ 退出 2，且在联网之前就返回', () => {
-    const { status, output } = runCli(['test', '--config', configPath])
+  it('test 缺 --model ⇒ 退出 2，且在联网之前就返回', async () => {
+    const { status, output } = await runCli(['test', '--config', deadConfigPath])
     expect(status).toBe(2)
     // 退出码 2 已经说明它在拨号前返回了；这里再把"它到底说了什么"钉住，
     // 免得将来有人把这个分支改成别的失败原因而退出码恰好还是 2。
     expect(output).toContain('--model')
   })
 
-  it('test --model 但没 --yes ⇒ 仍然退出 2（成本闸在发消息之前）', () => {
-    // 注意：这条会真的去拉 /v1/models（只读、零积分），但 DEAD_ORIGIN 连不上 ⇒
-    // 大概率走"网关不可达"的 1。所以这里只断言**不是 0**：
-    // 本测试要保证的是"绝不发出那条会花额度的消息"，不是某一个具体退出码。
-    const { status } = runCli(['test', '--model', 'cn:fixture', '--config', configPath])
-    expect(status).not.toBe(0)
+  it('test --model 但没 --yes ⇒ 退出 2，且一条会花额度的请求都没发', async () => {
+    // ★ 假网关（不是死端口）才让这条断言真的在测**成本闸**：模型在目录里、单价 x0.00，
+    // 唯一还能拦住它的就是 --yes。若把 --yes 那道闸删掉，这里会退 0 并发出真实 POST。
+    const before = gatewayHits.length
+    const { status, output } = await runCli(['test', '--model', FREE_MODEL_ID, '--config', fakeConfigPath])
+
+    // ★ 安全属性排在最前：一条会花额度的请求都不许发出去。
+    // 成本闸要先读目录才知道单价 ⇒ 会有 GET；但绝不能有 /chat/completions。
+    const calls = gatewayHits.slice(before)
+    expect(calls.some(call => call.url.includes('/chat/completions'))).toBe(false)
+    expect(calls.every(call => call.method === 'GET')).toBe(true)
+    expect(calls.length).toBeGreaterThan(0)
+
+    expect(status).toBe(2)
+    expect(output).toContain('--yes')
+  })
+
+  it('test --model 不在目录里 ⇒ 退出 2，且一样不发那条消息', async () => {
+    const before = gatewayHits.length
+    const { status, output } = await runCli(['test', '--model', 'cn:not-in-catalog', '--yes', '--config', fakeConfigPath])
+    expect(gatewayHits.slice(before).some(call => call.url.includes('/chat/completions'))).toBe(false)
+    expect(status).toBe(2)
+    expect(output).toContain('目录里没有模型')
   })
 })
