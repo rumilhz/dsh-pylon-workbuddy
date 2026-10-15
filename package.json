@@ -76,11 +76,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tearslee/dsh-workbuddy2api.git"
+    "url": "git+https://github.com/rumilhz/dsh-pylon-workbuddy.git"
   },
   "bugs": {
-    "url": "https://github.com/tearslee/dsh-workbuddy2api/issues"
+    "url": "https://github.com/rumilhz/dsh-pylon-workbuddy/issues"
   },
-  "homepage": "https://github.com/tearslee/dsh-workbuddy2api#readme",
+  "homepage": "https://github.com/rumilhz/dsh-pylon-workbuddy#readme",
   "license": "MIT"
 }

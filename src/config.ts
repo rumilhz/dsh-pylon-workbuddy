@@ -102,6 +102,8 @@ export interface GatewayPluginConfig {
    *
    * 默认是本插件仓库 —— 它的 Actions 从**上游源码**交叉编译三平台产物并挂 Release。
    * 上游自身不提供任何预编译产物，所以这里指向的不是上游。
+   *
+   * ⚠️ 顺序依赖：本仓库首次发出 `v*` tag 之前，Release 里没有产物，下载会 404。
    */
   binaryReleaseRepo: string
   /**
@@ -182,7 +184,7 @@ export const DEFAULT_CONFIG: GatewayPluginConfig = {
   graceMs: 5000,
   crashRestartLimit: 3,
   env: {},
-  binaryReleaseRepo: 'tearslee/dsh-workbuddy2api',
+  binaryReleaseRepo: 'rumilhz/dsh-pylon-workbuddy',
   binaryReleaseBase: '',
   autoDownloadBinary: false,
   defaultRealm: '',

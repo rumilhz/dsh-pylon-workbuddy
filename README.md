@@ -3,8 +3,7 @@
 **把 [workbuddy2api](https://github.com/HanawaBanana/workbuddy2api) 网关接进 [DeepSeek Harness（dsh）](https://www.npmjs.com/package/@deepseek-ai/dsh) 的插件。**
 
 > 包名 `dsh-pylon-workbuddy`（家族前缀 `dsh-pylon-`）。旧名 `dsh-workbuddy2api` 只作为历史
-> 出现在下面的「npm registry」告警与本仓库的 GitHub 地址里 —— 那是**仓库地址**与**已弃用的旧包名**，
-> 不是当前包名。
+> 包名出现在下面的「npm registry」告警里 —— 那是**已弃用的旧包名**，不是当前包名。
 
 装上之后：
 
@@ -118,19 +117,24 @@ llm-pi-ai:                    ← profile 条目，settings namespace
 
 ## 安装
 
+> **⚠️ 本仓库已迁到 `rumilhz/dsh-pylon-workbuddy`，首次发布前 Release 是空的。**
+> 三种方式都从本仓库的 Release 取东西；要等 CI（`.github/workflows/release-binaries.yml`
+> 与 `release-plugin.yml`）跑完第一个 `v*` tag，Release 里才会有 tarball 与网关二进制。
+> **在那之前，下面这些下载链接会 404。**
+
 ### 方式一：一条命令直装（推荐）
 
 **不需要先下载文件** —— pnpm 支持直接以 Release 的 tarball URL 作为依赖（已实测：装出来是真实目录、非 `link:`）：
 
 ```bash
-dsh plugin --profile web add https://github.com/tearslee/dsh-workbuddy2api/releases/download/v0.4.0/dsh-pylon-workbuddy-0.4.0.tgz
+dsh plugin --profile web add https://github.com/rumilhz/dsh-pylon-workbuddy/releases/download/v0.4.0/dsh-pylon-workbuddy-0.4.0.tgz
 ```
 
 升级时把 URL 里的版本号换掉即可。
 
 ### 方式二：先下载再本地安装
 
-在 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases/latest) 下载 `dsh-pylon-workbuddy-<版本>.tgz`，然后：
+在 [Releases](https://github.com/rumilhz/dsh-pylon-workbuddy/releases/latest) 下载 `dsh-pylon-workbuddy-<版本>.tgz`，然后：
 
 ```bash
 dsh plugin --profile web add file:/绝对路径/dsh-pylon-workbuddy-0.4.0.tgz
@@ -139,8 +143,8 @@ dsh plugin --profile web add file:/绝对路径/dsh-pylon-workbuddy-0.4.0.tgz
 ### 方式三：从源码安装
 
 ```bash
-git clone https://github.com/tearslee/dsh-workbuddy2api
-cd dsh-workbuddy2api
+git clone https://github.com/rumilhz/dsh-pylon-workbuddy
+cd dsh-pylon-workbuddy
 npm install
 node node_modules/typescript/bin/tsc -p tsconfig.json   # 必须先构建出 lib/
 npm pack --pack-destination dist
@@ -154,7 +158,7 @@ dsh plugin --profile web add file:./dist/dsh-pylon-workbuddy-0.4.0.tgz
 >
 > 而 npm 上的 **`dsh-workbuddy2api` 这个旧名已被他人占用**
 > —— 发布者是 [Boiser](https://www.npmjs.com/~boiser)，线上版本为 `0.4.9` ~ `0.6.8`（`latest = 0.6.8`），
-> 与本仓库（`tearslee/dsh-workbuddy2api`，当前 `0.4.0`）**不是同一个项目**。
+> 与本仓库（`rumilhz/dsh-pylon-workbuddy`，当前 `0.4.0`）**不是同一个项目**。
 >
 > ⚠️ **版本号也不能用来区分**：本仓库从 `0.4.0` 进入这条线，npm 上那个旧名包也停在
 > `0.4.9` ~ `0.6.8`。**唯一可靠的区分方式是来源（URL / tarball）。**
@@ -164,7 +168,7 @@ dsh plugin --profile web add file:./dist/dsh-pylon-workbuddy-0.4.0.tgz
 > - ❌ **不要执行 `dsh plugin add dsh-workbuddy2api`** —— 旧名已被占用，它会装到别人的包，而不是本插件；
 > - ✅ 请用上面三种方式之一，从**本仓库的 GitHub Release** 取 `dsh-pylon-workbuddy-<版本>.tgz`；
 > - 装完请核对**来源**：本仓库的版本线是 `0.1.x` / `0.3.x` / `0.4.x`，且只从
->   `github.com/tearslee/dsh-workbuddy2api` 的 Release 分发。
+>   `github.com/rumilhz/dsh-pylon-workbuddy` 的 Release 分发。
 >
 > 本仓库未在 npm 发布。新名 `dsh-pylon-workbuddy` 在 2026-10-15 核对时尚未被占用
 > （registry 返回 404），但**是否发布取决于后续决定** —— 安装时**认 URL / 认 tarball**，不要只认包名。
@@ -225,7 +229,7 @@ dsh 起来之后，在对话里执行：
 | `listenPort` | `7863` | 仅用于端口占用判定与状态展示 |
 | `autoStart` | `true` | dsh 启动时是否自动拉起网关 |
 | `autoDownloadBinary` | `false` | dsh 启动时若缺二进制是否**自动下载**（见下） |
-| `binaryReleaseRepo` | `tearslee/dsh-workbuddy2api` | 预编译二进制的发布仓库 |
+| `binaryReleaseRepo` | `rumilhz/dsh-pylon-workbuddy` | 预编译二进制的发布仓库（首次发 tag 前 Release 为空 → 下载 404） |
 | `binaryReleaseBase` | `''` | 覆盖下载根地址（自建镜像 / 钉版本） |
 | `defaultRealm` | `''` | 登录默认域（`cn` / `global`）；为空则每次询问 |
 | `realmPrefixPolicy` | `strip-cn` | 模型 id 的前缀策略，见下 |
@@ -249,7 +253,7 @@ dsh 起来之后，在对话里执行：
 | 账号凭证 | `~/.dsh/wb2api/auths/` |
 | 池状态 | `~/.dsh/wb2api/data/state.json` |
 
-产物来自本仓库的 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases)（GitHub Actions 从**上游源码原样交叉编译**，未改一行上游代码），下载后会与 `SHA256SUMS.txt` 比对，**不匹配就拒绝安装**。
+产物来自本仓库的 [Releases](https://github.com/rumilhz/dsh-pylon-workbuddy/releases)（GitHub Actions 从**上游源码原样交叉编译**，未改一行上游代码），下载后会与 `SHA256SUMS.txt` 比对，**不匹配就拒绝安装**。
 
 生成的 `config.json` 有两处刻意选择：
 
@@ -388,6 +392,7 @@ dsh 起来之后，在对话里执行：
 - **无账号时网关「启动 ≠ 可用」。** 进程起来但 `/healthz` 报 `healthy: 0`，插件会把状态标为「运行中（无可用账号）」而不是假装成功。
 - **切换账号仍会重启网关。** 切换靠重命名凭证文件实现（见上）。较新的网关有 5 秒热加载能自行感知，本插件仍走一次重启以确保新旧二进制行为一致，代价是中断正在进行的请求 1~3 秒。
 - **预编译产物来自本仓库的 CI，可能与上游最新提交有延迟。** 想紧跟上游就自行 `go build`（把 `binaryPath` 指向你的产物，插件不会覆盖它）。上游若改动凭证格式或路由，本插件的适配可能滞后。
+- **本仓库刚迁到 `rumilhz/dsh-pylon-workbuddy`，首次发 `v*` tag 之前 Release 是空的。** 那之前插件下载网关二进制会 404（安装用的 `.tgz` 同理取不到）；CI 跑完 `release-binaries.yml` 后恢复正常。
 - **模型目录默认只在首次创建 provider 时同步一次，之后不再跟着网关变。** 这是刻意的取舍：你会在「设置 → 模型」里把自动生成的整份清单删到真正要用的那几个，任何「自动补齐 / 自动同步」都会把删掉的模型重新塞回来。因此装填逻辑是**存在即什么都不做** —— 插件升级到新版本同样不会碰你筛过的清单。要手动看差异用只读的 `/wb2api-provider`（打印「网关有而你没配」「你配了而网关已下架」「数值不一致」三组，**不写任何东西**）；要在 provider 缺失时按网关目录创建整份清单用 `/wb2api-provider --create`；要把网关后来新增的模型补进来用 `/wb2api-provider --rebuild` —— 它是**只增不删**：`新增 = 网关目录 − 你配置里现有的 − 插件曾提供过的`，你删掉的模型**不会复活**，没有任何新增时**一个字节都不写**。这条判据靠插件自己记的**墓碑集合**（「迄今提供过哪些模型 id」，落在 `<dsh home>/.wb2api/state.json`，与网关自己的运行目录 `~/.dsh/wb2api/` 是两个目录）。因此有两条边界要说清楚：① **这份状态文件被删掉，删除记录就没了** —— 那之后第一次 `--rebuild` 会看到「没有上一次记录」，此时它**一个都不加**并说明原因（它分不清哪些是新增、哪些是你删的），同时把网关当前目录记为基线，之后的刷新只补真正新增的；② provider 若是在**这个版本之前**就存在的，插件从来没有它的「提供过」记录，而启动时的 `present` **不会**拿你当前的清单去替你造一条（那等于把"你留着的"当成"我们提供过的"，下一次 `--rebuild` 就会把你删掉的模型全加回来）—— 于是你在升级前删掉的那些模型，在第一轮 `--rebuild` 时仍然不会被补回来：那一轮会**一个都不加**（并把出口指明白），同时把网关当前目录立成基线，记忆从那一刻开始生效。**出口是 `/wb2api-provider --rebuild --reset`**（设置卡片上那个「完全重建（⚠️ 会覆盖你在模型页做的筛选）」按钮走同一条路）：它**忽略**这条记忆、以网关目录为准**整份覆盖**，并把**丢掉的 id 逐个报出来**；代价正是它会覆盖你在模型页做的筛选，所以它只能由你显式敲下/点下 —— 插件自己永远不会选它。`--rebuild` 是个显式开关，插件自己永远不会主动选它。**两条写入路径都带安全网**：写前把 profile patch 备份到 **profile 之外**，写后独立读回核对条目数，条目变少就自动回滚并说明原因。如果 provider 缺失且创建失败（settings 不可用、写入被拒、网关连不上），插件会把一份**可直接粘贴**的 YAML 打进日志，并明确说明「此时引用它的路由指向一个不存在的 provider」—— 它不会替你猜数值，也不会删改任何既有配置。
 
 ---
@@ -459,7 +464,7 @@ pwsh -File scripts/migrate-settings.ps1
 ## 合规声明
 
 - 本插件**不包含、不转发 workbuddy2api 的任何源码**。网关源码始终来自上游仓库。
-- 本仓库的 [Releases](https://github.com/tearslee/dsh-workbuddy2api/releases) 提供**由本仓库 CI 从上游源码原样交叉编译**的可执行文件（构建过程见 `.github/workflows/release-binaries.yml`：先断言上游工作区未被修改，再校验产物内嵌的 `vcs.modified=false`）。上游不提供预编译产物，这些二进制是为了让用户不必自装 Go 工具链；**许可证与免责声明仍归上游**。介意第三方构建的话，请自行 `go build` 并把 `binaryPath` 指向你的产物。
+- 本仓库的 [Releases](https://github.com/rumilhz/dsh-pylon-workbuddy/releases) 提供**由本仓库 CI 从上游源码原样交叉编译**的可执行文件（构建过程见 `.github/workflows/release-binaries.yml`：先断言上游工作区未被修改，再校验产物内嵌的 `vcs.modified=false`）。上游不提供预编译产物，这些二进制是为了让用户不必自装 Go 工具链；**许可证与免责声明仍归上游**。介意第三方构建的话，请自行 `go build` 并把 `binaryPath` 指向你的产物。
 - workbuddy2api 的许可与免责声明由其自身条款约束，使用前请自行阅读。
 - 本插件以 MIT 许可发布，与上游无隶属关系。
 

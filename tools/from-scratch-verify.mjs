@@ -656,7 +656,7 @@ const { module: binaryModule, entry: binaryEntry } = await importBinaryModule()
 if (binaryModule === undefined) {
   check('能从发布产物 lib/gateway-binary.js 取到下载器', false, `${binaryEntry} 不存在（先跑 npm run build）`)
 } else {
-  const repo = binaryModule.DEFAULT_RELEASE_REPO ?? 'tearslee/dsh-workbuddy2api'
+  const repo = binaryModule.DEFAULT_RELEASE_REPO ?? 'rumilhz/dsh-pylon-workbuddy'
   const target = binaryModule.currentTarget(process.platform, process.arch)
   const asset = target === undefined ? '(不支持的平台)' : binaryModule.assetName(target)
   const clientUrl = binaryModule.assetUrl(repo, target ?? { os: 'windows', arch: 'amd64' })
@@ -1109,7 +1109,7 @@ if (!existsSync(setupRunnerPath)) {
     repoPath: '', workingDir: GATEWAY_RUN_DIR, listenPort: PORT, autoStart: true, realmPrefixPolicy: 'strip-cn',
     modelsTtlSeconds: 600, requestTimeoutSeconds: 600, idleTimeoutSeconds: 300, firstTokenTimeoutSeconds: 120,
     healthTimeoutSeconds: 3, graceMs: 5000, crashRestartLimit: 3, env: {},
-    binaryReleaseRepo: binaryModule?.DEFAULT_RELEASE_REPO ?? 'tearslee/dsh-workbuddy2api', binaryReleaseBase: '',
+    binaryReleaseRepo: binaryModule?.DEFAULT_RELEASE_REPO ?? 'rumilhz/dsh-pylon-workbuddy', binaryReleaseBase: '',
     autoDownloadBinary: false, defaultRealm: '', providerName: PROVIDER_ID, providerNamespace: SETTINGS_NS,
     writeBackupDir: join(SCRATCH, 'write-backups'), registerOwnProvider: false,
   }

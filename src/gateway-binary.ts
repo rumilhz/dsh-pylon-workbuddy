@@ -27,8 +27,13 @@ import { join } from 'node:path'
 import { dshHome } from './plugin-state.js'
 import { extractFile, ZipError } from './zip.js'
 
-/** 下载源的默认仓库（本插件仓库的 Release，非上游）。 */
-export const DEFAULT_RELEASE_REPO = 'tearslee/dsh-workbuddy2api'
+/**
+ * 下载源的默认仓库（本插件仓库的 Release，非上游）。
+ *
+ * ⚠️ 顺序依赖：新仓库首次发布前 Release 里**没有**二进制，此时下载会 404。
+ * 发一个 `v*` tag 让 `release-binaries.yml` 跑完即可（见 README「已知限制」）。
+ */
+export const DEFAULT_RELEASE_REPO = 'rumilhz/dsh-pylon-workbuddy'
 
 /** 校验和文件名（由发布工作流生成）。 */
 export const CHECKSUMS_NAME = 'SHA256SUMS.txt'

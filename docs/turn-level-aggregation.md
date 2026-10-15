@@ -11,17 +11,17 @@
 
 **① 修复前** —— 上游后台把一次对话拆成无数次小请求
 
-<img src="https://raw.githubusercontent.com/tearslee/dsh-workbuddy2api/main/docs/images/before-fragmented.png" alt="修复前：同一请求在上游后台被拆分为几十上百个 RequestID" width="100%">
+<img src="https://raw.githubusercontent.com/rumilhz/dsh-pylon-workbuddy/main/docs/images/before-fragmented.png" alt="修复前：同一请求在上游后台被拆分为几十上百个 RequestID" width="100%">
 
 **② 上游第一次修复后** —— 加了会话头族，**但仍然是多个请求**（因为 OpenAI 兼容客户端不带 `conversationId`）
 
-<img src="https://raw.githubusercontent.com/tearslee/dsh-workbuddy2api/main/docs/images/after-upstream-fix-still-fragmented.png" alt="上游第一次修复后仍然碎片化" width="100%">
+<img src="https://raw.githubusercontent.com/rumilhz/dsh-pylon-workbuddy/main/docs/images/after-upstream-fix-still-fragmented.png" alt="上游第一次修复后仍然碎片化" width="100%">
 
 **③ PR #73 合并后** —— 按对话轮聚合，一次对话轮一个 RequestID
 
-<img src="https://raw.githubusercontent.com/tearslee/dsh-workbuddy2api/main/docs/images/after-pr-fixed-1.png" alt="修复后：RequestID 按对话轮聚合" width="100%">
+<img src="https://raw.githubusercontent.com/rumilhz/dsh-pylon-workbuddy/main/docs/images/after-pr-fixed-1.png" alt="修复后：RequestID 按对话轮聚合" width="100%">
 
-<img src="https://raw.githubusercontent.com/tearslee/dsh-workbuddy2api/main/docs/images/after-pr-fixed-2.png" alt="修复后：用量明细按轮聚合" width="100%">
+<img src="https://raw.githubusercontent.com/rumilhz/dsh-pylon-workbuddy/main/docs/images/after-pr-fixed-2.png" alt="修复后：用量明细按轮聚合" width="100%">
 
 （截图取自上游 issue `#35` 与 `#69`。）
 
