@@ -1,7 +1,7 @@
 /**
  * 一条命令跑完全部闸门（A2）。
  *
- *   <node> tools/_run-suites.mjs                 离线：类型检查 / 单测 / 本地 e2e / CLI 契约 / 构建
+ *   <node> tools/_run-suites.mjs                 离线：类型检查 / 单测 / 可移植性 / 本地 e2e / CLI 契约 / 构建
  *   <node> tools/_run-suites.mjs --network       追加「真实网关」集成（联网，真实对话会花额度）
  *   <node> tools/_run-suites.mjs --skip unit     跳过标签含 "unit" 的套件（可重复，也支持 --skip=unit）
  *   <node> tools/_run-suites.mjs --help          打印这张表就退出
@@ -73,6 +73,22 @@ const CLI_SKIP =
       : undefined
 
 /**
+ * 期望值可移植性那条的 SKIP 原因（`undefined` = 该跑）。
+ *
+ * 它扫 `tests/**` 的**期望值**，拦"没写平台守卫、却把路径分隔符写死在期望值里"的断言
+ * —— 那类断言在本地（正是那台机器）永远绿，只在别的平台上红，于是每次都要等推到 CI
+ * 才知道。工具的用法与判据见 `tools/platform-path-lint.mjs` 文件头。
+ *
+ * 它靠 `node_modules/typescript` 解析 AST（grep 会把几十处**入参**误报成违规，
+ * 那种检查活不过一周）。typescript 不在时显式记 SKIP，绝不当成 PASS —— 见规矩①。
+ */
+const LINT_TOOL = 'tools/platform-path-lint.mjs'
+const LINT_SKIP =
+  !existsSync(join(ROOT, LINT_TOOL)) ? `${LINT_TOOL} 不存在（可移植性闸门未提供？）`
+    : !existsSync(join(ROOT, TSC)) ? `${TSC} 不存在（typescript 没装，无法解析 AST）`
+      : undefined
+
+/**
  * 浏览器半边那条的 SKIP 原因（`undefined` = 该跑）。
  *
  * 这条套件是**一支独立脚本**（不是 vitest 用例），它的入口是 `CLIENT_LAUNCH`：
@@ -100,6 +116,10 @@ const CLIENT_SKIP =
 const SUITES = [
   ['typecheck (tsc --noEmit)', TSC, ['-p', 'tsconfig.json', '--noEmit']],
   ['unit (vitest run tests/unit)', VITEST, ['run']],
+  // 期望值可移植性：拦"本地那台机器替你掩盖了它在别的平台上会红"的断言。
+  // 本地是 Windows、CI 是 Linux，这类断言只有出了本地才炸 —— 所以它必须是一条
+  // **本地基线里的**闸门，而不是等 CI 报。判据与用法见那个工具的文件头。
+  ['test 可移植性 (期望值不写死路径分隔符)', LINT_TOOL, [], { skip: LINT_SKIP }],
   // 条件展开：这条 e2e 的 spec 是仓库的一部分，被删/改名时记 SKIP 而不是让 vitest 报"找不到用例"
   ...(existsSync(join(ROOT, SPEC_LOCAL))
     ? [['e2e 写路径安全网 (真实文件系统, 离线)', VITEST, ['run', '--config', E2E_CONFIG, SPEC_LOCAL]]]

@@ -8,7 +8,7 @@
  * 那正是 2026-10-08 真实发生的事故形态。
  */
 
-import { basename, dirname } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   BACKUP_DIR_NAME,
@@ -286,7 +286,9 @@ describe('defaultBackupDir', () => {
   it('落在 DSH home 之下、profile 目录之外', () => {
     const home = 'C:\\fake\\.dsh'
     const dir = defaultBackupDir(home)
-    expect(dir).toBe(`${home}\\${BACKUP_DIR_NAME}`)
+    // ⚠️ 期望值由 join 构造，**不许**写成 `${home}\\${BACKUP_DIR_NAME}`：
+    // 那样写只在 Windows 上成立（Linux 上 join 产出 `/`），本地永远发现不了。
+    expect(dir).toBe(join(home, BACKUP_DIR_NAME))
     // 铁律 ①：备份绝不能落进 profiles\<name>\ 里面。
     expect(dir).not.toContain('profiles')
   })

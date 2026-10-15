@@ -40,22 +40,26 @@ afterEach(() => {
 
 describe('resolveStateLocation', () => {
   it('profileContext.home 优先', () => {
+    // 期望值里的 home **用同一个常量**，不重抄字面量：这条断的是「取 profileHome」，
+    // 与分隔符无关。path 那一项本来就该由 join 构造。
+    const profileHome = 'C:\\temp\\home'
     const location = resolveStateLocation({
-      profileHome: 'C:\\temp\\home',
+      profileHome,
       env: { DSH_HOME: 'D:\\other' },
       homedir: () => 'C:\\Users\\nobody',
     })
     expect(location).toEqual({
-      home: 'C:\\temp\\home',
-      path: join('C:\\temp\\home', '.wb2api', 'state.json'),
+      home: profileHome,
+      path: join(profileHome, '.wb2api', 'state.json'),
       source: 'profile',
     })
   })
 
   it('没有 profileContext 时退到环境变量 DSH_HOME', () => {
-    const location = resolveStateLocation({ env: { DSH_HOME: 'D:\\iso\\home' }, homedir: () => 'C:\\Users\\nobody' })
+    const isolated = 'D:\\iso\\home'
+    const location = resolveStateLocation({ env: { DSH_HOME: isolated }, homedir: () => 'C:\\Users\\nobody' })
     expect(location?.source).toBe('env')
-    expect(location?.home).toBe('D:\\iso\\home')
+    expect(location?.home).toBe(isolated)
   })
 
   it('两个都没有时退到 ~/.dsh（DSH 自己的默认值）', () => {

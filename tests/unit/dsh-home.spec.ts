@@ -92,8 +92,11 @@ function seedRuntime(home: string): string {
 
 describe('resolveDshHome（唯一的 home 口径）', () => {
   it('DSH_HOME 非空 ⇒ 直接用它（不再看 os.homedir）', () => {
-    expect(resolveDshHome({ env: { DSH_HOME: 'D:\\iso\\home' }, homedir: () => 'C:\\Users\\nobody' }))
-      .toBe('D:\\iso\\home')
+    // 期望值取自**同一个来源**（入参本身），而不是重抄一遍字面量 ——
+    // 这条断的是「逐字返回」，与分隔符无关，重抄字面量只会凭空引入平台假设。
+    const isolated = 'D:\\iso\\home'
+    expect(resolveDshHome({ env: { DSH_HOME: isolated }, homedir: () => 'C:\\Users\\nobody' }))
+      .toBe(isolated)
   })
 
   it('DSH_HOME 缺失或只有空白 ⇒ 退回 `~/.dsh`（DSH 自己的默认值）', () => {
@@ -109,7 +112,8 @@ describe('resolveDshHome（唯一的 home 口径）', () => {
   })
 
   it('dshHome()（字符串版）跟着 DSH_HOME 走，空白值不认', async () => {
-    await withDshHome('D:\\iso\\home', () => { expect(dshHome()).toBe('D:\\iso\\home') })
+    const isolated = 'D:\\iso\\home'
+    await withDshHome(isolated, () => { expect(dshHome()).toBe(isolated) })
     await withDshHome('   ', () => { expect(dshHome()).toBe(join(homedir(), '.dsh')) })
     await withDshHome(undefined, () => { expect(dshHome()).toBe(join(homedir(), '.dsh')) })
   })
