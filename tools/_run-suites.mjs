@@ -3,6 +3,7 @@
  *
  *   <node> tools/_run-suites.mjs                 离线：类型检查 / 单测 / 可移植性 / 本地 e2e / CLI 契约 / 构建
  *   <node> tools/_run-suites.mjs --network       追加「真实网关」集成（联网，真实对话会花额度）
+ *   <node> tools/_run-suites.mjs --no-build      不跑表尾的构建（调用方自己构建，见下）
  *   <node> tools/_run-suites.mjs --skip unit     跳过标签含 "unit" 的套件（可重复，也支持 --skip=unit）
  *   <node> tools/_run-suites.mjs --help          打印这张表就退出
  *
@@ -10,6 +11,25 @@
  *   ① **缺失的入口记 SKIP，绝不记成 PASS** —— "这条检查没跑" 与 "这条检查过了"
  *      不能长得一样。SKIP 不影响退出码，但汇总里会逐个点名。
  *   ② 只看子进程**退出码**，不解析它的输出；FAIL 时只回放末尾 3 行，不刷屏。
+ *
+ * ## 这个脚本就是 CI 的测试步（2026-10-15 起）
+ *
+ * 起因是一条**系统性**的假绿：`.github/workflows/*.yml` 以前只跑 `vitest run`，而
+ * `vitest.config.ts` 的 include 只有 `tests/unit/**` ⇒ `tests/e2e/**`（写路径安全网、
+ * CLI 离线契约）**从来没进过 CI**。本地之所以"全绿"，靠的恰恰是那台机器上活着的网关 ——
+ * 假绿只在开发机上骗人，CI 上是空白。
+ *
+ * 所以 workflow 里现在写的是 `node tools/_run-suites.mjs`，而不是一串散装命令：
+ * 加了新的离线闸门时，CI 自动跟着走，不需要有人记得去改 YAML。
+ *
+ * ## `--no-build` 是给谁用的（为什么不是默认）
+ *
+ * 表尾那条 `build` 会 emit 到 `lib/`。有的 workflow（`release-plugin.yml`）紧接着
+ * 自己就要 `tsc -p tsconfig.json` 建 `lib/` 并**逐文件断言产物**、再 `npm pack` ——
+ * 那里再跑一遍就是重复做功。给它 `--no-build` 后，这条**不进 SUITES**，但也不是
+ * 悄悄消失：它照旧在表里、照旧打印一行 SKIP 及原因（见规矩①）。
+ * 反过来，`ci.yml` 用**不带** `--no-build` 的那份：那条工作流没有自己的构建步，
+ * 产物断言直接吃本脚本建出来的 `lib/`。
  *
  * 表是**硬编码**的（不扫目录：扫目录会把临时文件、备份当成套件）。
  * 套件入口都在 node_modules 里，所以依赖没装时整张表都会 SKIP —— 这是故意的，
@@ -34,6 +54,7 @@ const ROOT = join(HERE, '..')
 
 const argv = process.argv.slice(2)
 const NETWORK = argv.includes('--network')
+const NO_BUILD = argv.includes('--no-build')
 const HELP = argv.includes('--help') || argv.includes('-h')
 const SKIP_FLAGS = [
   ...argv.flatMap((value, index) => (value === '--skip' ? [argv[index + 1] ?? ''] : [])),
@@ -112,6 +133,17 @@ const CLIENT_SKIP =
     : !existsSync(join(ROOT, CLIENT_LAUNCH)) ? `${CLIENT_LAUNCH} 不存在（入口缺了）`
       : undefined
 
+/**
+ * 构建那条的 SKIP 原因（`undefined` = 该跑）。
+ *
+ * `--no-build` 的用法与理由见文件头。这里要强调的只有一点：**它不是 PASS** ——
+ * 表里照样有一行 SKIP、汇总里照样点名，只是退出码不受影响（规矩①）。
+ * 谁用了这个开关，谁就欠一次自己的构建与产物断言。
+ */
+const BUILD_SKIP = NO_BUILD
+  ? '被 --no-build 排除：调用方自己构建并断言产物（如 release-plugin.yml 的 Build lib/ 步）'
+  : undefined
+
 /** [标签, 入口(相对 ROOT), 参数, { skip?, timeoutMs? }?] */
 const SUITES = [
   ['typecheck (tsc --noEmit)', TSC, ['-p', 'tsconfig.json', '--noEmit']],
@@ -142,7 +174,7 @@ const SUITES = [
     [],
     { skip: CLIENT_SKIP },
   ],
-  ['build (tsc -p tsconfig.json → lib/)', TSC, ['-p', 'tsconfig.json']],
+  ['build (tsc -p tsconfig.json → lib/)', TSC, ['-p', 'tsconfig.json'], { skip: BUILD_SKIP }],
   // 联网组：只有 --network 才进表（不进表 = 这条本就不在本次范围内，表尾会说明）
   ...(NETWORK
     ? [[
@@ -158,12 +190,14 @@ const clock = (ms) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`)
 const line = (char = '-', width = 78) => char.repeat(width)
 
 if (HELP) {
-  console.log('用法：node tools/_run-suites.mjs [--network] [--skip <关键字>]... [--help]')
+  console.log('用法：node tools/_run-suites.mjs [--network] [--no-build] [--skip <关键字>]... [--help]')
   console.log('')
   console.log(`本次${NETWORK ? '包含' : '不含'}联网套件（--network 控制）。表：`)
-  for (const [label, entry, args = []] of SUITES) {
+  for (const [label, entry, args = [], options = {}] of SUITES) {
     console.log(`  - ${label}`)
     console.log(`      ${NODE} ${entry} ${args.join(' ')}`.trimEnd())
+    // 已经注定跳过的那几条（--no-build）在帮助里就写明，免得"表里有、跑起来没有"。
+    if (options.skip !== undefined) console.log(`      （本次跳过：${options.skip}）`)
   }
   console.log('')
   console.log('判定：退出码 0 ⇒ PASS；入口不存在 ⇒ SKIP（绝不算 PASS）；有 FAIL ⇒ 本脚本退出码 1。')
@@ -171,7 +205,8 @@ if (HELP) {
 }
 
 console.log(`suite runner · ${ROOT}`)
-console.log(`node ${NODE} · ${NETWORK ? '含联网套件' : '仅离线（--network 可加联网套件）'}`)
+console.log(`node ${NODE} · ${NETWORK ? '含联网套件' : '仅离线（--network 可加联网套件）'}`
+  + (NO_BUILD ? ' · --no-build（构建那条改由调用方负责，下面会记 SKIP）' : ''))
 console.log(line())
 
 const results = []

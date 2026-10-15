@@ -51,6 +51,25 @@ afterEach(() => {
   }
 })
 
+/**
+ * 构造 installer，并**默认把 `runtimeDir` 也钉死在一个临时目录里**。
+ *
+ * 为什么必须显式给：`ensure()` 内部会 `prepareRuntime()` → `ensureRuntimeDir(runtimeDir())`，
+ * 而 `runtimeDir()` 的缺省值是 `~/.dsh/wb2api`。不隔离的话，**跑一次单测就会在开发机的
+ * 真实 home 里生成 `config.json` + `auths/` + `data/`**（随机 api_key）。
+ * 2026-10-15 在真 Linux 上逐个 spec 扫了一遍，会写活体的**只有本文件**。
+ *
+ * 两个后果都不轻：
+ *   · 用户还没装过插件，home 里先长出一份运行配置 —— 测试污染了活体环境；
+ *   · 那个 `config.json` 的存在会**翻转别的代码分支**（`resolveWorkingDir()` 与
+ *     `AccountStore.authDir()` 都以 `existsSync(<runtime>/config.json)` 为判据）⇒
+ *     在干净机器上"跑过一次测试"会改变后续测试走的分支。
+ *     `ensureRuntimeDir` 自己不会覆盖已存在的 `config.json`（所以活体配置没被改写），
+ *     但"创建"这件事本身就不该由测试做。
+ */
+const makeInstaller = (options: ConstructorParameters<typeof GatewayBinaryInstaller>[0]) =>
+  new GatewayBinaryInstaller({ runtimeDir: tempDir(), ...options })
+
 /** 构造一个只含一个 stored 条目的最小 zip（本用例只关心字节流，不测 deflate）。 */
 function buildStoredZip(name: string, payload: Uint8Array): Uint8Array {
   const nameBytes = new TextEncoder().encode(name)
@@ -219,7 +238,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
   it('下载 → 校验 → 解压 → 落盘，内容逐字节一致', async () => {
     const dir = tempDir()
     const release = fakeRelease(payload, target)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -241,7 +260,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
     const release = fakeRelease(payload, target)
     // 校验和清单指向另一个（正确的）摘要：模拟产物被中间人替换。
     const tampered = new TextEncoder().encode(`${'0'.repeat(64)}  ${release.asset}\n`)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -257,7 +276,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
   it('拿不到校验和清单 → 不下载、不安装，并给出自行编译的替代路径', async () => {
     const dir = tempDir()
     let downloadedAsset = false
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -278,7 +297,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
     const dir = tempDir()
     const other = new TextEncoder().encode(`${'a'.repeat(64)}  wb2a-server-linux-amd64.zip\n`)
     const release = fakeRelease(payload, target)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -292,7 +311,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
     const dir = tempDir()
     const zip = buildStoredZip('README.txt', new TextEncoder().encode('oops'))
     const checksums = new TextEncoder().encode(`${sha256(zip)}  wb2a-server-windows-amd64.zip\n`)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -308,7 +327,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
     const existing = join(dir, 'wb2a-server.exe')
     writeFileSync(existing, 'user-built-binary')
     let touched = false
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -327,7 +346,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
     const existing = join(dir, 'wb2a-server.exe')
     writeFileSync(existing, 'old-binary')
     const release = fakeRelease(payload, target)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',
@@ -343,7 +362,7 @@ describe('GatewayBinaryInstaller.ensure', () => {
   it('安装目录不存在时自动创建', async () => {
     const dir = join(tempDir(), 'nested', 'bin')
     const release = fakeRelease(payload, target)
-    const installer = new GatewayBinaryInstaller({
+    const installer = makeInstaller({
       installDir: dir,
       target,
       repo: 'owner/repo',

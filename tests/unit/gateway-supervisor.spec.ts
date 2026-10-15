@@ -9,6 +9,28 @@ import { resolveConfig } from '../../src/config.js'
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {} }
 
+/**
+ * 在「临时改 `DSH_HOME`」的作用域里跑一段断言，退出时无条件还原。
+ *
+ * 与 `dsh-home.spec.ts` 里那个同名助手是同一形态（这里没有共享的测试助手模块，
+ * 复制 9 行比新开一个模块更小的改动；两处都改的时候记得一起改）。
+ *
+ * 为什么非要它：`countAuthFiles()` 的兜底基准是 `<DSH home>/wb2api`，
+ * 而 `DSH_HOME` 未设时那就是**活体** `~/.dsh/wb2api` —— 一个属于开发机的目录。
+ * 断言若直接读它，就变成"这台机器上恰好有 1 个凭证"的假绿（2026-10-15 实测）。
+ */
+async function withDshHome(value: string | undefined, body: () => void | Promise<void>): Promise<void> {
+  const previous = process.env['DSH_HOME']
+  try {
+    if (value === undefined) delete process.env['DSH_HOME']
+    else process.env['DSH_HOME'] = value
+    await body()
+  } finally {
+    if (previous === undefined) delete process.env['DSH_HOME']
+    else process.env['DSH_HOME'] = previous
+  }
+}
+
 /** 起一个真正的 HTTP 服务当假网关，让探活走完整网络路径。 */
 async function startFakeGateway(handler: (path: string) => { status: number; body: string }): Promise<{ port: number; close: () => Promise<void> }> {
   const server: Server = createServer((request, response) => {
@@ -269,15 +291,60 @@ describe('GatewaySupervisor.countAuthFiles', () => {
     expect(supervisor.countAuthFiles()).toBe(2)
   })
 
-  it('未配置 repoPath 或无 auths 目录时返回 0（回落到插件运行目录）', () => {
+  /**
+   * ★ 2026-10-15 修掉一条**永远不可能失败**的断言。
+   *
+   * 旧版（标题「未配置 repoPath 或无 auths 目录时返回 0」）断言的是
+   * `Number.isInteger(count) && count >= 0` —— 只要函数不抛错、不返回负数就绿，
+   * 与"到底数了几个"无关。而本机 `~/.dsh/wb2api/auths` 有 **1** 个凭证文件
+   * （实测：`countAuthFiles()` 在无 repoPath 时返回 **1**，见下方契约），
+   * 于是"标题说 0、实测是 1"这件事被那条断言完整地掩盖了。
+   *
+   * ## 这条测试的契约是什么（先想清楚，再改断言）
+   *
+   * `countAuthFiles()` 数的是**网关真正会读的那个 `auths/`**，基准顺序与
+   * `resolveWorkingDir()` 同源：`workingDir` → `repoPath` → **`defaultRuntimeDir()`
+   * 即 `<DSH home>/wb2api`**（没有显式配置时，凭证在插件自己的运行目录里 ——
+   * 那正是 `/wb2api-setup` 自动下载二进制的用户唯一会有的位置）。
+   *
+   * 所以正确的表述**不是**「没有 repoPath 就返回 0」，而是：
+   *   · 基准落到 `<DSH home>/wb2api`；**那里**没有 `auths/*.json` 时才为 0。
+   * 「返回 0」只是"那个目录恰好是空的"的**结果**，不是这条分支的契约。
+   * 产品行为（`src/gateway-supervisor.ts` 的 `countAuthFiles`，其文档注释明确写了
+   * 这个回落）与上面的契约一致 ⇒ **是测试写错，不是产品 bug**，故不改 `src/`。
+   *
+   * ## 为什么改成这样就能失败（旧版不能）
+   *
+   * 用 `DSH_HOME` 指一个**隔离 home**：基准跟着 home 走 ⇒ 结果由我们造的文件决定。
+   * 若哪天有人把基准改回"cwd"或"活体 `~/.dsh/wb2api`"，下面的数字立刻对不上：
+   * 本机活体那份有 1 个凭证，空隔离 home 那一条会变成 1 而不是 0。
+   */
+  it('🔴 未配置 workingDir/repoPath ⇒ 基准是插件运行目录（<DSH home>/wb2api），与 cwd、活体 home 无关', async () => {
     const { runtime } = makeSubprocess()
-    // 无 repoPath 时基准是插件运行目录 ~/.dsh/wb2api；本机若那里恰有凭证文件，
-    // 断言会变得依赖环境，因此只断言「不抛错且是非负整数」。
-    const count = new GatewaySupervisor({ config: resolveConfig({}), subprocess: runtime, logger: silentLogger }).countAuthFiles()
-    expect(Number.isInteger(count)).toBe(true)
-    expect(count).toBeGreaterThanOrEqual(0)
-    const dir = mkdtempSync(join(tmpdir(), 'wb2api-'))
-    expect(new GatewaySupervisor({ config: resolveConfig({ repoPath: dir }), subprocess: runtime, logger: silentLogger }).countAuthFiles()).toBe(0)
+    // 显式写空：默认值将来若变，这条测试的意图不应该跟着漂。
+    const noPaths = { repoPath: '', workingDir: '' }
+
+    // ① 隔离 home 里放 2 个 .json + 1 个 .txt ⇒ 只数 .json。
+    const home = mkdtempSync(join(tmpdir(), 'wb2api-home-'))
+    mkdirSync(join(home, 'wb2api', 'auths'), { recursive: true })
+    writeFileSync(join(home, 'wb2api', 'auths', 'a.json'), '{}')
+    writeFileSync(join(home, 'wb2api', 'auths', 'b.json'), '{}')
+    writeFileSync(join(home, 'wb2api', 'auths', 'readme.txt'), 'x')
+    await withDshHome(home, () => {
+      expect(new GatewaySupervisor({ config: resolveConfig(noPaths), subprocess: runtime, logger: silentLogger }).countAuthFiles()).toBe(2)
+    })
+
+    // ② 隔离 home **是空的**（连 wb2api/ 都没有）⇒ 0。
+    //    ★ 这条是关键：本机活体 `~/.dsh/wb2api/auths` 里有 1 个凭证文件，
+    //    基准若偷偷落回活体，这里就会是 1 ⇒ 红。（旧断言此时照样绿。）
+    const emptyHome = mkdtempSync(join(tmpdir(), 'wb2api-nohome-'))
+    await withDshHome(emptyHome, () => {
+      expect(new GatewaySupervisor({ config: resolveConfig(noPaths), subprocess: runtime, logger: silentLogger }).countAuthFiles()).toBe(0)
+    })
+
+    // ③ 「有 repoPath 但 auths/ 不存在」⇒ 0（旧标题里那一半是真的，留着）。
+    const bare = mkdtempSync(join(tmpdir(), 'wb2api-bare-'))
+    expect(new GatewaySupervisor({ config: resolveConfig({ repoPath: bare }), subprocess: runtime, logger: silentLogger }).countAuthFiles()).toBe(0)
   })
 
   it('workingDir 优先于 repoPath（与网关真实 cwd 同源）', () => {

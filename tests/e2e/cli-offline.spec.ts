@@ -9,10 +9,19 @@
  *   ② 未知命令 ⇒ 2（用法错，与"网关不可达"的 1 分开）；
  *   ③ `test` 缺 `--model` ⇒ 2，且在联网之前就返回；
  *   ④ `test` 的两道成本闸（模型不在目录里 / 没给 `--yes`）⇒ 2，
- *      且**一条会花额度的请求都没发**。
+ *      且**一条会花额度的请求都没发**；
+ *   ⑤ **未知选项 / 写错的选项 ⇒ 2**（`-j` / `-y` / `--nonexistent` / `--limit=30` /
+ *      选项缺值），同样在联网之前返回，并且**一条请求都不发**。
  *
  * ③ ④ 是最要紧的：`test` 是那个 CLI 里**唯一会花额度**的命令，而"缺参数"与"闸门"
  * 必须在拨号之前就被拦住 —— 否则一次笔误就是一次真实消费。
+ *
+ * ⑤ 是 2026-10-15 补的，症状和 ①② 同族但更隐蔽：`-j` 之类**认不出的短横线词**
+ * 以前被**静默忽略**。`command` 取的是「第一个不以 `-` 开头的词」，于是 `wb2api -j`
+ * 里没有任何词能当命令 ⇒ 落到默认值 `status` ⇒ **真去打了一趟网关**。
+ * 用户以为 `-j` 是 json，实际做的是另一件事，而且退出码还是 0（网关活着时）。
+ * 所以下面那三条一律**指向活着的假网关**再断言"一条请求都没发" —— 用死端口的话，
+ * 旧行为会先以"网关不可达"(1) 失败，正好把"它去拨号了"这件事掩盖过去（同 ③④ 的坑）。
  *
  * ## 离线性是构造出来的，不是假设的（2026-10-15 修掉一轮假绿）
  *
@@ -38,7 +47,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -169,6 +178,81 @@ describe('tools/wb2api.mjs：离线契约（不发请求）', () => {
     const { status, output } = await runCli(['definitely-not-a-command', '--config', deadConfigPath])
     expect(status).toBe(2)
     expect(output).toContain('definitely-not-a-command')
+  })
+
+  /**
+   * ⑤ 三条一组：认不出的选项 ⇒ 退出 2，且**一条请求都不发**。
+   *
+   * 为什么必须对着**活着的**假网关断言：这三条断言的核心是"它没有去拨号"。
+   * 对着死端口跑的话，旧行为（静默落到 `status`）会以"网关不可达"(1) 失败，
+   * 而"它其实拨号了"这件事就被掩盖了 —— 那正是 ③④ 里踩过的坑。
+   */
+  it('-j ⇒ 退出 2（--json 没有短别名），且在拨号前返回；提示里给出 --json', async () => {
+    const before = gatewayHits.length
+    const { status, output } = await runCli(['-j', '--config', fakeConfigPath])
+    expect(gatewayHits).toHaveLength(before) // ★ 安全性：一条请求都没发
+    expect(status).toBe(2)
+    expect(output).toContain('未知选项 -j')
+    // 帮助文本要能让人看懂"为什么 -j 不认"：说清长写法，而不是只说一句"未知"。
+    expect(output).toContain('--json')
+  })
+
+  it('-y ⇒ 退出 2（--yes 没有短别名），且在拨号前返回', async () => {
+    const before = gatewayHits.length
+    const { status, output } = await runCli(['-y', '--config', fakeConfigPath])
+    expect(gatewayHits).toHaveLength(before)
+    expect(status).toBe(2)
+    expect(output).toContain('未知选项 -y')
+    expect(output).toContain('--yes')
+  })
+
+  it('--nonexistent ⇒ 退出 2，且在拨号前返回', async () => {
+    const before = gatewayHits.length
+    const { status, output } = await runCli(['--nonexistent', '--config', fakeConfigPath])
+    expect(gatewayHits).toHaveLength(before)
+    expect(status).toBe(2)
+    expect(output).toContain('未知选项 --nonexistent')
+  })
+
+  it('帮助里写的选项 = 解析器认的选项（两个方向都查）', async () => {
+    // `-h` 那次假绿的**反方向**：帮助里明写「--help, -h」，解析器却不认 `-h` ⇒
+    // 它掉进默认命令 `status` 去拨了活体网关（本机绿、Linux 红）。
+    // 反过来同样有害：悄悄多认一个选项、帮助里从不提它，用户只能靠报错去猜。
+    // 这里把两个方向钉在一起 —— 白名单在 tools/wb2api.mjs 的 VALUE_OPTIONS/FLAG_OPTIONS
+    // 里（那个脚本是**立即执行的**，import 它会真的跑起来，所以只能读源码取表）。
+    const { status, output } = await runCli(['--help', '--config', deadConfigPath])
+    expect(status).toBe(0)
+
+    const source = readFileSync(CLI, 'utf8')
+    const listOf = (name: string): string[] => {
+      const match = new RegExp(`const ${name} = \\[([^\\]]*)\\]`).exec(source)
+      if (match === null) throw new Error(`tools/wb2api.mjs 里找不到 ${name}（表被改名了？）`)
+      return [...match[1]!.matchAll(/'([a-z-]+)'/g)].map((entry) => entry[1]!)
+    }
+    const declared = [...listOf('VALUE_OPTIONS'), ...listOf('FLAG_OPTIONS')]
+    expect(declared.length).toBeGreaterThan(8) // 表本身别被解析成空数组（否则下面两条恒真）
+
+    // 正方向：白名单里每一个都得在帮助里出现。
+    for (const name of declared) expect(output, `帮助里没写 --${name}`).toContain(`--${name}`)
+    // 反方向：帮助里提到的每个**长选项**都必须真被接受。
+    // （只查 `--`：帮助里用 `-j` 之类当反例，那些本来就不该被接受。）
+    const mentioned = [...new Set([...output.matchAll(/--([a-z][a-z-]*)/g)].map((entry) => entry[1]!))]
+    for (const name of mentioned) expect(declared, `帮助提到了但解析器不认：--${name}`).toContain(name)
+  })
+
+  it('选项写法写错也拦：--limit=30 不认；选项后面该有值却没有（--config 结尾）⇒ 2', async () => {
+    // 同一个病根的两种形态：把「认不出来」变成「按默认值静默跑」。
+    // `--limit=30` 以前整串被忽略、按默认 20 跑；`--config` 后面空着以前直接回落默认配置。
+    const before = gatewayHits.length
+    const inline = await runCli(['models', '--limit=30', '--config', fakeConfigPath])
+    expect(inline.status).toBe(2)
+    expect(inline.output).toContain('未知选项 --limit=30')
+
+    const dangling = await runCli(['status', '--config'])
+    expect(dangling.status).toBe(2)
+    expect(dangling.output).toContain('缺一个值')
+
+    expect(gatewayHits).toHaveLength(before)
   })
 
   it('test 缺 --model ⇒ 退出 2，且在联网之前就返回', async () => {

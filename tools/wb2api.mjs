@@ -16,6 +16,9 @@
  *           **从不打印**（要提只提 sha256 前 12 位）。
  * 只读纪律：status / models / usage / checkin 全部只读；
  *           唯一会改账号状态且花额度的是 test，且必须有 --yes。
+ * 选项纪律：**认不出的选项 / 选项缺值 ⇒ 用法错（退出码 2）**，在拨号之前。
+ *           2026-10-15 之前它们被静默忽略，`-j` 会顺手去跑一遍默认命令 `status`
+ *           （真拨网关）—— 见 findOptionProblem 的注释。
  */
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -60,6 +63,67 @@ const option = (name) => {
   const index = argv.indexOf(`--${name}`)
   return index === -1 ? undefined : argv[index + 1]
 }
+
+/**
+ * 已知选项 —— **必须与 `--help` 里那张表逐字对应**。
+ *
+ * 为什么要一张白名单，而不是"凡是不认识的横线词就忽略"：2026-10-15 之前的真实行为是
+ * **静默忽略**。`command` 取的是「第一个不以 `-` 开头的词」，于是 `wb2api -j` 里
+ * 没有任何词能当命令 ⇒ 落到默认值 `status` ⇒ **去拨了一趟活体网关**。
+ * 用户以为 `-j` 是 json，实际是一次真实查询（还会在 401/不可达时退 1，把人往
+ * 「网关坏了」的方向带）。写错的选项必须**当场**报用法错，不能变成另一个命令。
+ *
+ * 取值与不取值分开写：前者后面那个词是它的**值**（长相可能很像选项），
+ * 逐个校验时必须跳过，否则 `--prompt -j` 会被误报成未知选项。
+ */
+const VALUE_OPTIONS = ['config', 'origin', 'gateway', 'limit', 'model', 'max-tokens', 'prompt']
+const FLAG_OPTIONS = ['json', 'yes', 'force', 'all', 'help']
+const LONG_OPTIONS = [...VALUE_OPTIONS, ...FLAG_OPTIONS]
+const SHORT_OPTIONS = Object.values(SHORT_ALIASES)
+
+/** 这个词是不是一个**已知**选项（`-` 开头且在白名单里）。 */
+const isKnownOption = (token) => {
+  if (token.startsWith('--')) return LONG_OPTIONS.includes(token.slice(2))
+  return token.startsWith('-') && SHORT_OPTIONS.includes(token.slice(1))
+}
+
+/** 认不出的选项就给一句"像哪个"的建议（`-j` ⇒ `--json`）。 */
+const suggestFor = (token) => {
+  if (!token.startsWith('-') || token.startsWith('--') || token.length !== 2) return ''
+  const letter = token.slice(1)
+  const hits = LONG_OPTIONS.filter((name) => name.startsWith(letter))
+  return hits.length === 0 ? '' : `　（是不是想写 ${hits.map((name) => `--${name}`).join(' / ')}？）`
+}
+
+/**
+ * 从 argv 里找出第一个**认不出来**的选项；全认得出就返回 undefined。
+ *
+ * 规矩只有一条：**任何以 `-` 开头、且不处在「取值位置」的词，都必须是已知选项。**
+ * （处在取值位置的词是上一条选项的值，哪怕是 `-1` 这种负数，见 `--limit -1`。）
+ */
+function findOptionProblem() {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]
+    if (!token.startsWith('-')) continue // 位置参数（命令）由 command 那一支管
+    if (token.startsWith('--')) {
+      const name = token.slice(2)
+      // `--limit=30` 也走这里：本 CLI 只认空格分隔的写法，不认 `=`（旧版会把
+      // `--limit=30` 整串**静默忽略**、悄悄按默认 20 跑 —— 同一种病，一起治）。
+      if (!LONG_OPTIONS.includes(name)) return `未知选项 ${token}${suggestFor(token)}`
+      if (VALUE_OPTIONS.includes(name)) {
+        const next = argv[index + 1]
+        if (next === undefined || isKnownOption(next)) {
+          return `${token} 缺一个值（后面是 ${next === undefined ? '命令结尾' : `选项 ${next}`}，它需要的东西不是选项）`
+        }
+        index += 1 // 这个词是它的值，可能长得像选项（`--prompt -j`），不参与校验。
+      }
+      continue
+    }
+    if (!SHORT_OPTIONS.includes(token.slice(1))) return `未知选项 ${token}${suggestFor(token)}`
+  }
+  return undefined
+}
+
 const line = (char = '-', width = 78) => char.repeat(width)
 const print = (label, value) =>
   console.log(`${label.padEnd(16)} ${typeof value === 'string' ? value : JSON.stringify(value)}`)
@@ -516,10 +580,19 @@ function printHelp() {
 
 通用选项
   --origin <url>             覆盖网关地址（默认读 config.json 的 listen，即 http://127.0.0.1:7863）
+  --gateway <url>            --origin 的同义词（早期拼法，保留）
   --config <path>            覆盖 config.json 路径
-  --json                     输出原始 JSON（models / usage）
-  --help, -h                 显示本帮助（**唯一**带短别名的选项：--json / --yes /
-                             --force 都只有长写法，写 -j / -y / -f 不认）
+  --json                     输出原始 JSON（**只有 models / usage 用得上**）
+  --help, -h                 显示本帮助
+  --all                      --limit 0 的同义词（models 全量）
+
+选项怎么写（两种都会被**当场**拦下，不是忽略）
+  · 短别名只认帮助里列出的：目前**只有 --help / -h** 这一对。
+    --json 没有 -j、--yes 没有 -y、--force 没有 -f、--limit 没有 -l ——
+    想要 JSON 就写 --json。写 -j 的旧后果是**静默改跑默认命令 status**（真去拨网关），
+    看起来「没报错」，其实你做的是另一件事。
+  · 取值一律用空格：--limit 30。写 --limit=30 不认（旧版会把整串静默忽略、按默认 20 跑）。
+  认不出的选项、以及「选项后面该有值却没有」⇒ **退出码 2**，在拨号之前。
 
 test 的选项（唯一会花钱的命令）
   --model <id>               必需。要测的模型 id（models 命令里那一列）
@@ -531,7 +604,7 @@ test 的选项（唯一会花钱的命令）
 
 退出码
   0  成功
-  2  用法错（缺少必需参数、参数非法、命中成本闸）
+  2  用法错（未知选项 / 选项缺值 / 缺少必需参数 / 参数非法 / 命中成本闸）
   1  网关不可达，或接口返回错误（含 401 / 5xx / 非 JSON）
 
 凭据纪律
@@ -548,6 +621,19 @@ test 的选项（唯一会花钱的命令）
 
 // ── 主流程 ────────────────────────────────────────────────────────────────
 try {
+  // ★ 选项校验排在最前面，**早于** --help 与读配置：写错的选项不该有任何副作用。
+  //   以前这里没有校验，`-j` / `-y` / `--nonexistent` 会被静默忽略，然后去跑默认
+  //   命令 `status`（真拨网关）。见 findOptionProblem 的注释。
+  const problem = findOptionProblem()
+  if (problem !== undefined) {
+    usage(
+      problem +
+        '\n  本 CLI 只认 --help 里列出的选项；短别名目前只有 --help/-h 那一对。' +
+        '\n  --json / --yes / --force 都**只有长写法**：写 -j / -y / -f 一律报用法错，' +
+        '\n  不会再像以前那样被静默忽略、再拿默认命令 status 去打网关。',
+    )
+  }
+
   if (flag('help') || flag('h') || command === 'help') {
     printHelp()
     process.exit(0)

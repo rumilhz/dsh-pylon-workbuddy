@@ -478,20 +478,35 @@ node node_modules/typescript/bin/tsc -p tsconfig.json   # 构建（不要用 pnp
 node node_modules/vitest/vitest.mjs run                  # 单元测试
 ```
 
-不想逐条敲上面这些命令（以及下面那条 e2e）时，用一条命令跑完全部闸门 ——
-类型检查、单测、本地 e2e（真文件系统的写路径安全网）、独立 CLI 的离线契约、构建：
+不想逐条敲上面这些命令（以及下面那条 e2e）时，用一条命令跑完全部**离线**闸门 ——
+类型检查、单测、期望值可移植性闸门、本地 e2e（真文件系统的写路径安全网）、
+独立 CLI 的离线契约、设置卡片的 client 闸门、构建（表尾那条会 emit 到 `lib/`）：
 
 ```bash
-npm run test:suites                # 离线；联网的那条只报 SKIP
-npm run test:suites -- --network    # 追加真实网关集成（见下，会花额度）
-npm run test:suites -- --skip unit  # 只想跑一部分时，被排除的会写成 SKIP（不是 PASS）
+npm run test:suites                    # 离线；联网的那条只报 SKIP
+npm run test:suites -- --network       # 追加真实网关集成（见下，会花额度）
+npm run test:suites -- --no-build      # 不跑表尾的构建（调用方自己构建，如 release-plugin.yml）
+npm run test:suites -- --skip unit     # 只想跑一部分时，被排除的会写成 SKIP（不是 PASS）
 ```
+
+**CI 跑的就是这一条命令**，不是一串散装命令。`ci.yml` 里曾经只跑
+`vitest run`，而 `vitest.config.ts` 的 include 只有 `tests/unit/**` ⇒
+`tests/e2e/**` 从来没进过 CI；本机"全绿"恰恰因为有活体网关在 ⇒ 那是只在开发机上
+骗人的假绿。现在加一条离线闸门只需要改 `tools/_run-suites.mjs`，CI 自动跟着走。
 
 判定规则只有一条：**看子进程退出码**。入口不存在（比如依赖没装）一律记 `SKIP`
 并写明原因 —— "这条检查没跑"和"这条检查过了"不会长得一样。退出码：有 `FAIL` ⇒ 1，否则 0。
 
 独立 CLI（不经 dsh 插件，用来直接查网关，**只读**）：`node tools/wb2api.mjs --help`（或 `npm run cli -- --help`）。
-它的离线契约（`--help` / 未知命令 / `test` 缺 `--model`）已在上面那张套件表里，入口缺失记 `SKIP` 而不是 `PASS`。
+它的离线契约（`--help` / `-h` / 未知命令 / 未知选项 / `test` 缺 `--model` 与两道成本闸）已在上面那张套件表里，
+入口缺失记 `SKIP` 而不是 `PASS`。
+
+> **行为变更（2026-10-15）**：认不出的选项 ⇒ **用法错，退出码 2**，且在拨号之前返回。
+> 以前它们被**静默忽略**，而 `command` 取的是"第一个不以 `-` 开头的词" ⇒ `wb2api -j`
+> 一个词都认不出来 ⇒ 落到默认命令 `status` ⇒ **真去打了一趟活体网关**（用户以为 `-j` 是 json）。
+> 同一个病根的另两种形态也一起治了：`--limit=30`（不认 `=`，以前整串被忽略、按默认 20 跑）
+> 与"选项后面该有值却没有"（如结尾的 `--config`，以前回落默认配置）。
+> 短别名**只认帮助里列出的**（目前仅 `--help` / `-h`）：`--json` 没有 `-j`，`--yes` 没有 `-y`。
 
 集成测试会**真实发起对话**（消耗账号额度），需显式开启：
 

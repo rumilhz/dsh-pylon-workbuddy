@@ -32,11 +32,15 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Typecheck
-        run: node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
-
-      - name: Run unit tests
-        run: node node_modules/vitest/vitest.mjs run
+      # 与 ci.yml 同一条命令、同一张离线闸门表（typecheck / unit / 平台路径 / e2e 写路径 /
+      # cli 契约 / client 闸门），但**带 `--no-build`**：本工作流下面有自己的
+      # `Build lib/` + 逐文件产物断言 + `npm pack`，那里再建一遍纯属重复做功。
+      # `--no-build` 不会把那一步变成 PASS —— 汇总里会留一行 SKIP 并写明原因。
+      #
+      # 为什么发版也要跑这一整张表：这里原先是 `typecheck + vitest run` 的**子集**，
+      # 于是"离线 e2e / CLI 契约 / 卡片闸门坏了"照样能发出一个 tag。
+      - name: Suites（离线闸门，--no-build：构建由下面的 Build lib/ 负责）
+        run: node tools/_run-suites.mjs --no-build
 
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -51,6 +55,9 @@ jobs:
           fi
 
       - name: Build lib/
+        # 上面那步 Suites 带了 `--no-build`，构建就落在这里 —— 两者是一对，
+        # 删掉任何一半都会让这条工作流"没有构建也全绿"（产物断言会先炸，但别指望它）。
+        # 直调 tsc，不用 `pnpm build`（本仓库踩过它退出码 0 但 lib/ 没生成的坑）。
         run: node node_modules/typescript/bin/tsc -p tsconfig.json
 
       - name: Assert build artifacts exist

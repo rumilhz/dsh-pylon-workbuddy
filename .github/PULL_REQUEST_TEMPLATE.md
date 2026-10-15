@@ -8,10 +8,16 @@
 
 ## 验证
 
-<!-- 本仓库的验证要求：改了 TS 必须 tsc + vitest 通过。请贴出实际输出。 -->
+<!-- 本仓库的验证要求：改了 TS 必须跑下面这条（它就是 CI 的测试步）。请贴出实际输出。 -->
 
-- [ ] `node node_modules/typescript/bin/tsc -p tsconfig.json` 通过（**不要**用 `pnpm build`：本仓库踩过它假成功、`lib/` 不生成的坑）
-- [ ] `node node_modules/vitest/vitest.mjs run` 全绿
+- [ ] `node tools/_run-suites.mjs` 全绿（离线 7 条：typecheck · unit · 平台路径闸门 · e2e 写路径安全网 · cli 离线契约 · client 闸门 · build）
+      —— **别只跑 `vitest run`**：它的 include 只有 `tests/unit/**`，`tests/e2e/**` 一条都不跑，
+      而本机"全绿"恰恰可能靠的是你机器上活着的网关（2026-10-15 修掉的就是这条系统性假绿）。
+      构建是这条命令的一部分（表尾那条 `build`，直调 tsc）；**不要**用 `pnpm build`，
+      本仓库踩过它假成功、`lib/` 不生成的坑。
+- [ ] 新增的断言都问过一句：**网关停掉 / 换一个不可达的 config，这条还过吗？**
+      还过 ⇒ 它没在测东西（本仓库已有两条这种"永远绿"的教训，见 `tests/unit/gateway-supervisor.spec.ts`
+      的 `countAuthFiles` 与 `tests/unit/dsh-home.spec.ts` 的 home 口径）。
 - [ ] 改了涉及网关交互的代码时，已核对上游行为（请用**函数名**引用，不要用行号 —— 行号会随上游提交漂移）
 
 ## 涉及「看起来多余」的写法时

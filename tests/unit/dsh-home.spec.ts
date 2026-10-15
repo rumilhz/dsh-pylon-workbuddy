@@ -23,7 +23,7 @@
  * 文件里的后续用例（vitest 默认一个文件一个 worker，跨文件不会串）。
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -161,10 +161,15 @@ describe('GatewaySupervisor 的第 3 查找位（插件自己的安装落点）'
 
     await withDshHome(undefined, async () => {
       const supervisor = new GatewaySupervisor({ config: managedConfig(), subprocess: makeSubprocess(), logger: silentLogger })
-      // 这台机器上 `~/.dsh/wb2api/bin` 可能真有一个二进制（开发机就是），
-      // 所以断言的是「**不会**落到那个临时 home 里」而不是「必然抛错」。
+      // 这条是**两结局**的，且结局由那台机器决定：本机 `~/.dsh/wb2api/bin` 真有二进制
+      // （开发机就是），CI 上通常没有。所以不能写成"必然抛错"。
+      // 但两支**各自都要断言得够硬**，否则就是换个地方假绿（2026-10-15 复核）：
+      //   · 解析成功那一支：必须落在**真实 home** 的运行目录下（不只是"不是临时 home"）；
+      //   · 抛错那一支：错误文本必须仍指路（用户看到"找不到"得知道去哪配）。
+      // "隔离 home 会被认出来"那一支由上面那条（设了 DSH_HOME）覆盖 —— 两条各管一支。
       try {
         const resolved = await supervisor.resolveBinary()
+        expect(resolved.startsWith(join(homedir(), '.dsh', 'wb2api'))).toBe(true)
         expect(resolved.startsWith(join(home, 'wb2api'))).toBe(false)
       } catch (error) {
         expect(error instanceof Error).toBe(true)
@@ -198,12 +203,29 @@ describe('AccountStore.authDir 的兜底基准', () => {
     })
   })
 
-  it('没设 DSH_HOME ⇒ 基准回到 `~/.dsh/wb2api`（旧行为；那里没有 config.json 时才退回 cwd）', async () => {
+  it('🔴 DSH_HOME 指的 home 里没有 config.json ⇒ 退回 cwd 基准（resolve("./auths")），不抛错、也不去猜别的目录', async () => {
+    // 上面那条钉的是"隔离 home 里有 config.json"这一支；这条钉**另一支**，而且是确定性的。
+    // 起因：这一支原先只在"本机恰好没有 ~/.dsh/wb2api/config.json"时才被走到 ——
+    // CI 与开发机走的是不同的支，谁也不知道自己当时测的是哪一支（2026-10-15 复核）。
+    const home = tempDir('wb2a-empty-')
+    await withDshHome(home, () => {
+      const store = new AccountStore({ config: { ...DEFAULT_CONFIG, repoPath: '', workingDir: '' }, logger: silentLogger })
+      expect(store.authDir()).toBe(resolve('./auths'))
+      // 反例：任何"在没有 config.json 时也硬拼 <home>/wb2api/auths"的写法都会被这行抓住。
+      expect(store.authDir().startsWith(join(home, 'wb2api'))).toBe(false)
+    })
+  })
+
+  it('没设 DSH_HOME ⇒ 基准是 `~/.dsh/wb2api`（那里没有 config.json 时才退回 cwd）', async () => {
+    // 这一条**天然**依赖那台机器的活体 home：有 config.json ⇒ 用活体运行目录，没有 ⇒ 退回 cwd。
+    // 两支都是契约（旧行为），但"这次走的是哪一支"由机器决定。所以把判据**显式算出来**
+    // 再断言，而不是写成 `expect([A, B]).toContain(x)` —— 那种写法看不出在测哪一支，
+    // 也分不清"走了第三支"与"落在了可接受集合里"。
+    const liveRuntime = join(homedir(), '.dsh', 'wb2api')
+    const expected = existsSync(join(liveRuntime, 'config.json')) ? join(liveRuntime, 'auths') : resolve('./auths')
     await withDshHome(undefined, () => {
       const store = new AccountStore({ config: { ...DEFAULT_CONFIG, repoPath: '', workingDir: '' }, logger: silentLogger })
-      const expected = join(homedir(), '.dsh', 'wb2api', 'auths')
-      // 两种合法结局：本机有活体运行目录 ⇒ 用它；没有 ⇒ `resolve('./auths')`（cwd 基准）。
-      expect([expected, resolve('./auths')]).toContain(store.authDir())
+      expect(store.authDir()).toBe(expected)
     })
   })
 })

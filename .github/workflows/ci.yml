@@ -1,10 +1,31 @@
-# 插件自身的 CI：类型检查 + 单测。
+# 插件自身的 CI：一条命令跑完全部**离线**闸门。
+#
+# 判据（这条工作流存在的全部意义）：**网关停掉 / 换一个不可达的 config，这些检查还过吗？**
+#   过 ⇒ 它测的是真东西；不过 ⇒ 它测的是"那台开发机上恰好活着的东西"。
+#
+# ## 2026-10-15：修掉一条**系统性**的假绿
+#
+# 以前这里是散装四步（Typecheck / Build / Assert / Unit tests），测试步是
+# `node node_modules/vitest/vitest.mjs run`，而 `vitest.config.ts` 的 include 是
+# `tests/unit/**` ⇒ **`tests/e2e/**` 从来没进过 CI**。本机"全绿"靠的是那台机器上
+# 活着的网关（7863 有真 key），于是假绿只在开发机上骗人：CI 上那段是空白。
+#
+# 现在测试步只有一条 `node tools/_run-suites.mjs`，它跑的是那张**硬编码的离线表**：
+#   ① typecheck (tsc --noEmit)   ② unit (vitest run tests/unit)
+#   ③ 期望值可移植性闸门（拦"只有别的平台才炸"的断言）
+#   ④ e2e 写路径安全网（真实文件系统，离线）   ⑤ cli 离线契约（tools/wb2api.mjs 参数与退出码）
+#   ⑥ client bundle 离线闸门（设置卡片的浏览器半边）   ⑦ build (tsc -p tsconfig.json → lib/)
+# `tests/e2e/live-gateway.spec.ts` 是**唯一**打真网关、花额度的那个，它不在离线表里：
+# 要跑得显式 `--network` 且设 DSH_WB2API_E2E=1 / DSH_WB2API_E2E_CONFIRM=yes。
+#
+# ★ 为什么不再手写那份清单：加了新的离线闸门时，CI 得跟着走 —— 靠"记得改 YAML"
+#   迟早会漏，而那正是本次假绿的成因。表在脚本里，改一处即可。
+# ★ 本步**不带** `--no-build`：这条工作流自己没有构建步，下面的产物断言直接吃
+#   脚本建出来的 `lib/`。（带 `--no-build` 的那份在 release-plugin.yml，理由见那里。）
 #
 # 刻意**不跑** `pnpm build`：本仓库踩过「pnpm build 假成功、lib/ 不生成」的坑
 # （日志只有 cmd.exe 欢迎语，退出码却是 0），所以构建一律直调 tsc，
 # 并在最后断言 lib/index.js 真的产出了 —— 让"假成功"在 CI 上直接红掉。
-#
-# 集成测试（tests/e2e）会真实消耗账号额度，因此**不在 CI 里跑**（需显式开环境变量）。
 
 name: ci
 
@@ -37,21 +58,18 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Typecheck
-        run: node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
-
-      - name: Build
-        run: node node_modules/typescript/bin/tsc -p tsconfig.json
+      # 全部离线闸门（含 typecheck / unit / e2e 离线两条 / build）。退出码 0 才算过；
+      # 入口缺失记 SKIP 并在汇总里点名，绝不当成 PASS。
+      - name: Suites（离线：类型检查 · 单测 · 平台路径 · e2e 写路径 · cli 契约 · client 闸门 · 构建）
+        run: node tools/_run-suites.mjs
 
       - name: Assert build artifacts exist
         shell: bash
         run: |
           # 断言 lib/ 真产出（防「假成功」回归）。
+          # 构建发生在上面那条 Suites 步里（表尾那条 `build`），所以这步排在它后面。
           test -f lib/index.js
           test -f lib/zip.js
           test -f lib/gateway-binary.js
           test -f lib/login.js
           test -f lib/setup.js
-
-      - name: Unit tests
-        run: node node_modules/vitest/vitest.mjs run
